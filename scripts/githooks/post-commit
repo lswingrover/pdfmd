@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# post-commit: auto-publish the current branch to origin ("remote control").
+#
+# Part of the 1 branch = 1 worktree = 1 session model (AG_DEV_POLICY §14.4):
+# every session's work is backed up to its own origin/<branch> the moment it is
+# committed, so nothing sits stranded in a local worktree (the failure mode that
+# nearly lost the person_contacts WIP on 2026-06-19).
+#
+# Scope: feature/session branches only. The trunk branches (main, staging) are
+# pushed deliberately by the coordinator, never auto-pushed. main is also blocked
+# by the pre-push guard.
+#
+# Best-effort and non-blocking: it backgrounds the push and never fails the
+# commit, so a network hiccup or a non-fast-forward race is silent and harmless.
+# Install with: bash scripts/install-git-hooks.sh
+
+branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || exit 0
+[ -z "$branch" ] && exit 0
+case "$branch" in
+  main | master | staging | dev) exit 0 ;;
+esac
+
+# Background push; detach fully so the commit returns immediately and the hook
+# never reports a failure.
+( git push -u origin "$branch" >/dev/null 2>&1 & ) >/dev/null 2>&1
+exit 0

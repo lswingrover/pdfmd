@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# AG canonical pre-commit dispatcher — runs every executable in ./pre-commit.d/.
+# "Universal base + pluggable per-repo checks": add a repo check as a pre-commit.d/
+# fragment without editing this file. Any fragment exiting non-zero aborts the commit.
+#
+# Canonical source: lswingrover/scotty scripts/githooks/. AG_DEV_POLICY §14.4.
+# Activate once per clone: bash scripts/install-git-hooks.sh
+set -eu
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+D="$HERE/pre-commit.d"
+[ -d "$D" ] || exit 0
+for frag in "$D"/*; do
+  [ -x "$frag" ] || continue
+  "$frag" "$@" || exit $?
+done
+exit 0

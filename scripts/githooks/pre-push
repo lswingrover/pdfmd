@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# AG canonical pre-push dispatcher — runs every executable in ./pre-push.d/.
+# "Universal base + pluggable per-repo checks": add a repo check as a pre-push.d/
+# fragment without editing this file. Each fragment receives the push args ("$@")
+# and the ref list on stdin; any fragment exiting non-zero aborts the push.
+#
+# The universal base fragment is pre-push.d/10-main-guard (blocks direct origin/main
+# pushes unless ALLOW_MAIN_PUSH=1; PR-merge flow unaffected).
+#
+# Canonical source: lswingrover/scotty scripts/githooks/. AG_DEV_POLICY §14.4.
+# Activate once per clone: bash scripts/install-git-hooks.sh
+set -eu
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+D="$HERE/pre-push.d"
+[ -d "$D" ] || exit 0
+# git feeds the push ref list on stdin; capture it once so each fragment can read it.
+input=$(cat)
+for frag in "$D"/*; do
+  [ -x "$frag" ] || continue
+  printf '%s\n' "$input" | "$frag" "$@" || exit $?
+done
+exit 0
