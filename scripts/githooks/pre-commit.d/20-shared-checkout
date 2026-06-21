@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# 20-shared-checkout — block committing into a git checkout that a LIVE sibling
+# Claude/Cowork session also occupies (the "two sessions commit each other's work"
+# failure). AG UNIVERSAL BASE check (byte-identical across repos; see CANONICAL.sha256).
+#
+# Origin: prototyped in lswingrover/obrien #39 as a monolithic pre-commit; contributed
+# up into the AG canonical dispatcher here as a fragment so it composes with the other
+# base checks and rides the same core.hooksPath install. Canonical source now:
+# lswingrover/scotty scripts/githooks/. AG_DEV_POLICY §14.4.
+#
+# Why git-native (not a Claude PreToolUse hook): the collision guard only fires on Bash
+# tool calls, so in Cowork — where git runs through the osascript MCP — commits are NOT
+# intercepted. This fragment fires for EVERY commit regardless of surface. Companion to
+# pre-push.d/10-main-guard.
+#
+# Block only when ALL hold (otherwise allow silently / fail open):
+#   1. >=1 OTHER live session is registered against this checkout's toplevel
+#      (~/.claude/checkout-locks/<sha1(toplevel)[:16]>/, transcript mtime <30m), AND
+#   2. the current branch is NOT a shared integration branch (main/staging/dev/...), AND
+#   3. ALLOW_SHARED_COMMIT is unset.
+# An isolated worktree never trips this: git allows a feature branch in only one
+# worktree, so no sibling can be registered against the same toplevel on it.
+set -eu
+
+BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)
+
+# Shared branches multiple sessions are EXPECTED to commit to (the stated exception).
+# Override the set with EXEMPT_BRANCHES="main staging dev ...".
+EXEMPT_BRANCHES="${EXEMPT_BRANCHES:-main master staging dev develop}"
+for b in $EXEMPT_BRANCHES; do
+  [ "$BRANCH" = "$b" ] && exit 0
+done
+
+[ "${ALLOW_SHARED_COMMIT:-0}" = 1 ] && {
+  echo "pre-commit[shared-checkout]: commit ALLOWED via ALLOW_SHARED_COMMIT on $BRANCH" >&2
+  exit 0
+}
+
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+# Ask python to read the registry (same format/liveness as the collision hooks).
+# Prints the count of LIVE siblings (own session excluded) and their branches.
+SIBS=$(TOP="$TOP" python3 - <<'PY' 2>/dev/null || true
+import hashlib, json, os, time, glob
+top = os.environ["TOP"]
+key = hashlib.sha1(top.encode()).hexdigest()[:16]
+d = os.path.join(os.path.expanduser("~"), ".claude", "checkout-locks", key)
+LIVE = 30 * 60
+me = os.environ.get("CLAUDE_SESSION_ID", "")  # excluded if the harness exports it
+n, branches = 0, []
+for f in glob.glob(os.path.join(d, "*.json")):
+    sid = os.path.splitext(os.path.basename(f))[0]
+    if me and sid == me:
+        continue
+    try:
+        e = json.load(open(f))
+    except Exception:
+        e = {}
+    tp = e.get("transcript_path")
+    try:
+        if tp and os.path.exists(tp):
+            live = (time.time() - os.path.getmtime(tp)) < LIVE
+        else:
+            live = (time.time() - os.path.getmtime(f)) < LIVE
+    except Exception:
+        live = False
+    if live:
+        n += 1
+        if e.get("branch"):
+            branches.append(e["branch"])
+print(n)
+print(",".join(sorted(set(branches))))
+PY
+)
+
+COUNT=$(printf '%s\n' "$SIBS" | sed -n '1p')
+BRANCHES=$(printf '%s\n' "$SIBS" | sed -n '2p')
+[ -z "${COUNT:-}" ] && exit 0          # registry unreadable / no python — fail open
+[ "$COUNT" = "0" ] && exit 0           # no live siblings — allow
+
+NOTE=""
+[ -n "$BRANCHES" ] && NOTE=" (sibling branches: $BRANCHES)"
+echo >&2
+echo "BLOCKED: commit on '$BRANCH' — $COUNT other live Claude session(s) share this checkout$NOTE." >&2
+echo "  $TOP" >&2
+echo "Concurrent sessions in one working tree stage and commit each other's work." >&2
+echo "Isolate this session first:  bash scripts/session-worktree.sh $BRANCH" >&2
+echo "Then commit from the worktree. If you own this tree, override: ALLOW_SHARED_COMMIT=1 git commit ..." >&2
+echo >&2
+exit 1
