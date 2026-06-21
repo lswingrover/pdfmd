@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
-# 10-main-guard — block direct pushes to origin/main unless ALLOW_MAIN_PUSH=1.
+# 10-main-guard — block a DIRECT push to origin/main (or master) ONLY when that trunk is
+# NOT this repo's default/integration branch — i.e. a dev→main promote repo where main is a
+# protected promote-only mirror (AG_DEV_POLICY §14.5). Repos that integrate ON main (most
+# personal repos) push to it normally. Override with ALLOW_MAIN_PUSH=1.
 # AG UNIVERSAL BASE check (byte-identical across repos; see CANONICAL.sha256).
 # PR-merge flow is unaffected — only direct local HEAD:main pushes are gated.
 # Reads the push ref list on stdin (fed by the pre-push dispatcher).
 set -eu
 BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)
+DEFAULT=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)
 BLOCK=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   case $remote_ref in
-    refs/heads/main) BLOCK=1 ;;
+    refs/heads/main | refs/heads/master)
+      # guard only when the pushed trunk is NOT the repo's default branch
+      if [ -n "${DEFAULT:-}" ] && [ "$DEFAULT" != "main" ] && [ "$DEFAULT" != "master" ]; then BLOCK=1; fi ;;
   esac
 done
 [ "$BLOCK" = 1 ] || exit 0
 if [ "${ALLOW_MAIN_PUSH:-0}" = 1 ]; then
-  echo "pre-push[main-guard]: main push ALLOWED via ALLOW_MAIN_PUSH (branch $BRANCH)" >&2
+  echo "pre-push[main-guard]: push ALLOWED via ALLOW_MAIN_PUSH (branch $BRANCH)" >&2
   exit 0
 fi
 echo >&2
-echo "BLOCKED: direct push to origin/main from branch $BRANCH" >&2
-echo "If intentional, re-run with: ALLOW_MAIN_PUSH=1 git push ..." >&2
-echo "The guard keeps main-destined pushes deliberate (AG_DEV_POLICY §14.4)." >&2
+echo "BLOCKED: direct push to a protected trunk from branch $BRANCH — this repo integrates on '$DEFAULT'." >&2
+echo "Open a PR / let the ship promote, or if intentional re-run with: ALLOW_MAIN_PUSH=1 git push ..." >&2
+echo "Guard keeps promote-only trunk pushes deliberate (AG_DEV_POLICY §14.4/§14.5)." >&2
 echo >&2
 exit 1
