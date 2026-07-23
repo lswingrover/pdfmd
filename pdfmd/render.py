@@ -103,6 +103,11 @@ def _unwrap_hard_breaks(lines: List[str]) -> str:
     return "\n".join(out)
 
 
+# Markdown thematic break (---, ***, ___): the page-break rule is one of these.
+# It must never be treated as an orphan and merged into the previous paragraph.
+_THEMATIC_BREAK_PATTERN = re.compile(r"^(?:-{3,}|\*{3,}|_{3,})$")
+
+
 def _defragment_orphans(md: str, max_len: int = 45) -> str:
     """Merge short, isolated lines back into the previous paragraph.
 
@@ -113,6 +118,7 @@ def _defragment_orphans(md: str, max_len: int = 45) -> str:
         * sandwiched between blank lines
         * short (<= max_len chars)
         * not already a list item,
+        * not a thematic break (page-break rule),
       then we append it to the previous non-blank line.
     """
     lines = md.splitlines()
@@ -129,6 +135,7 @@ def _defragment_orphans(md: str, max_len: int = 45) -> str:
             and not lines[i + 1].strip()
             and 0 < len(line.strip()) <= max_len
             and not line.strip().startswith("#")
+            and not _THEMATIC_BREAK_PATTERN.match(line.strip())
         ):
             # Attach orphan to the previous non-blank line
             j = len(res) - 1
@@ -560,8 +567,10 @@ def render_document(
     if options.defragment_short:
         md = _defragment_orphans(md, max_len=options.orphan_max_len)
 
-    # Strip common footer artefacts like trailing "- - 1" or "- -" at end of lines
-    md = re.sub(r"\s*-+\s*-+\s*\d*\s*$", "", md, flags=re.MULTILINE)
+    # Strip common footer artefacts like trailing "- - 1" or "- -" at end of lines.
+    # Require whitespace between the two dash runs (\s+) so a bare "---" thematic
+    # break — e.g. the page-break rule inserted above — is never matched and eaten.
+    md = re.sub(r"\s*-+\s+-+\s*\d*\s*$", "", md, flags=re.MULTILINE)
 
     # Tighten spaces before punctuation
     md = re.sub(r"\s+([,.;:?!])", r"\1", md)
