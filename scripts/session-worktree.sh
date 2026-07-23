@@ -69,6 +69,28 @@ ROOT=$(git rev-parse --show-toplevel) || die "not inside a git repository"
 NAME=$(basename "$ROOT")
 SBR=$(printf '%s' "$BRANCH" | tr '/' '-')
 
+# --- Resolve this repo's integration branch as a remote-tracking ref (origin/<branch>) ---
+# origin/HEAD is the WRONG signal on this fleet: it mirrors the remote's DEFAULT branch (main),
+# but dev-first repos (laforge/riker/obrien) integrate on 'dev'. Resolve, in order: (1) explicit
+# override git config ag.integrationBranch; (2) first EXISTING of origin/dev, origin/staging
+# (exact refs); (3) origin/HEAD. Kept byte-identical to new-session.sh — resolve once, both paths.
+resolve_base_ref() {
+  local d="${1:-.}" cfg cand def
+  cfg=$(git -C "$d" config --get ag.integrationBranch 2>/dev/null || true)
+  if [ -n "$cfg" ] && git -C "$d" show-ref --verify --quiet "refs/remotes/origin/$cfg"; then
+    printf 'origin/%s\n' "$cfg"; return 0
+  fi
+  for cand in dev staging; do
+    if git -C "$d" show-ref --verify --quiet "refs/remotes/origin/$cand"; then
+      printf 'origin/%s\n' "$cand"; return 0
+    fi
+  done
+  def=$(git -C "$d" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's#^refs/remotes/##') || def=""
+  [ -n "$def" ] && { printf '%s\n' "$def"; return 0; }
+  return 1
+}
+
+
 if [ "$USE_TMP" -eq 1 ]; then
   DEST="/tmp/${NAME}-${SBR}-$(date '+%H%M%S')"
 else
@@ -99,9 +121,10 @@ if [ "$BRANCH_EXISTS" -eq 1 ]; then
   git -C "$ROOT" fetch origin "$BRANCH" >/dev/null 2>&1 || note "fetch failed (offline?) — using local ref"
   git -C "$ROOT" worktree add "$DEST" "$BRANCH"
 else
-  # New branch: base it on --ref, else origin/<branch> (won't exist here), else remote default.
+  # New branch: base it on --ref, else origin/<branch> (won't exist here), else the
+  # resolved integration branch (resolve_base_ref: dev-first->dev, ent-d->staging, else origin/HEAD).
   if [ -z "$REF" ]; then
-    DEFREF=$(git -C "$ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo "origin/main")
+    DEFREF=$(resolve_base_ref "$ROOT" || echo "origin/main")
     REF="$DEFREF"
   fi
   note "fetching base ref $REF"
