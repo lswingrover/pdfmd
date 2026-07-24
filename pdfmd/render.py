@@ -103,9 +103,20 @@ def _unwrap_hard_breaks(lines: List[str]) -> str:
     return "\n".join(out)
 
 
-# Markdown thematic break (---, ***, ___): the page-break rule is one of these.
-# It must never be treated as an orphan and merged into the previous paragraph.
+# The page-break separator emitted between pages (a Markdown thematic break).
+# Single source of truth so the renderer and the guards below stay in sync.
+_PAGE_BREAK = "---"
+
+# Any Markdown thematic break (---, ***, ___). Structural markup like the page
+# break above must survive the post-assembly cleanup passes unchanged: it must
+# never be swallowed as an orphan, be a merge *target* for an orphan, or be
+# eaten by the footer-artefact stripper.
 _THEMATIC_BREAK_PATTERN = re.compile(r"^(?:-{3,}|\*{3,}|_{3,})$")
+
+
+def _is_thematic_break(line: str) -> bool:
+    """True if ``line`` is a Markdown thematic break (e.g. the page-break rule)."""
+    return bool(_THEMATIC_BREAK_PATTERN.match(line.strip()))
 
 
 def _defragment_orphans(md: str, max_len: int = 45) -> str:
@@ -120,6 +131,10 @@ def _defragment_orphans(md: str, max_len: int = 45) -> str:
         * not already a list item,
         * not a thematic break (page-break rule),
       then we append it to the previous non-blank line.
+
+    A thematic break (the page-break rule) is never consumed as an orphan and is
+    never a merge *target*: an orphan at the top of a page stays on its own line
+    rather than being glued onto the "---" separator above it.
     """
     lines = md.splitlines()
     res: List[str] = []
@@ -135,13 +150,14 @@ def _defragment_orphans(md: str, max_len: int = 45) -> str:
             and not lines[i + 1].strip()
             and 0 < len(line.strip()) <= max_len
             and not line.strip().startswith("#")
-            and not _THEMATIC_BREAK_PATTERN.match(line.strip())
+            and not _is_thematic_break(line)
         ):
-            # Attach orphan to the previous non-blank line
+            # Attach orphan to the previous non-blank line — unless that line is a
+            # thematic break (page-break rule), which must stay a standalone rule.
             j = len(res) - 1
             while j >= 0 and not res[j].strip():
                 j -= 1
-            if j >= 0:
+            if j >= 0 and not _is_thematic_break(res[j]):
                 res[j] = (res[j].rstrip() + " " + line.strip()).strip()
                 i += 2
                 continue
@@ -176,6 +192,11 @@ def _safe_join_texts(parts: List[str]) -> str:
 _FOOTER_DASH_PATTERN = re.compile(r"^[-–—]\s*[-–—]?\s*\d*\s*$")
 _FOOTER_PAGENUM_PATTERN = re.compile(r"^\d+\s*$")
 _FOOTER_PAGE_LABEL_PATTERN = re.compile(r"^Page\s+\d+\s*$", re.IGNORECASE)
+
+# Trailing footer artefacts like "- - 1" or "- -" at the end of a line. The two
+# dash runs are separated by REQUIRED whitespace (\s+) so a bare thematic break
+# ("---", the page-break rule) is never matched and stripped. Applied per line.
+_TRAILING_FOOTER_PATTERN = re.compile(r"\s*-+\s+-+\s*\d*\s*$", re.MULTILINE)
 
 
 def _is_footer_noise(text: str) -> bool:
@@ -555,7 +576,7 @@ def render_document(
             )
 
         if options.insert_page_breaks and i < total - 1:
-            md_lines.extend(["---", ""])  # page rule
+            md_lines.extend([_PAGE_BREAK, ""])  # page rule (see _defragment_orphans guards)
 
         if progress_cb:
             progress_cb(i + 1, total)
@@ -568,9 +589,9 @@ def render_document(
         md = _defragment_orphans(md, max_len=options.orphan_max_len)
 
     # Strip common footer artefacts like trailing "- - 1" or "- -" at end of lines.
-    # Require whitespace between the two dash runs (\s+) so a bare "---" thematic
-    # break — e.g. the page-break rule inserted above — is never matched and eaten.
-    md = re.sub(r"\s*-+\s+-+\s*\d*\s*$", "", md, flags=re.MULTILINE)
+    # The pattern requires whitespace between its two dash runs, so the bare "---"
+    # page-break rule is preserved (see _TRAILING_FOOTER_PATTERN).
+    md = _TRAILING_FOOTER_PATTERN.sub("", md)
 
     # Tighten spaces before punctuation
     md = re.sub(r"\s+([,.;:?!])", r"\1", md)

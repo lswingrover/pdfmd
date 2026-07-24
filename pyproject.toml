@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdfmd"
-version = "1.6.0"
+version = "1.6.1"
 description = "Fast, local, privacy-first PDF to Markdown converter with OCR, multi-language support, table detection, and math preservation"
 readme = "README.md"
 requires-python = ">=3.8"

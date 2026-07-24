@@ -27,9 +27,12 @@ from .pipeline import pdf_to_markdown
 
 __all__ = ["Options", "pdf_to_markdown", "__version__"]
 
+# v1.6.1: fix page_breaks no-op — the "---" page rule was silently destroyed by
+#          post-assembly cleanup (orphan defragmentation + footer-artefact strip);
+#          the rule now survives both. Adds page-break regression tests.
 # v1.6.0: OCR language selection, multi-file batch GUI, GUI redesign,
 #          colorspace fix for image export, init-order crash fix.
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 
 def main() -> None:
