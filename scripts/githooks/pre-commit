@@ -10,7 +10,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 D="$HERE/pre-commit.d"
 [ -d "$D" ] || exit 0
 for frag in "$D"/*; do
-  [ -x "$frag" ] || continue
+  # Regular files only. A DIRECTORY carries the exec bit, so a bare -x test runs it
+  # and the dispatcher aborts with 126 — blocking every commit/push in the repo.
+  # Observed 2026-07-28: a stray pre-commit.d/__pycache__/ (any python import of a
+  # fragment creates one) took the whole hook down. Fail-safe: skip non-files.
+  [ -f "$frag" ] && [ -x "$frag" ] || continue
   "$frag" "$@" || exit $?
 done
 exit 0
