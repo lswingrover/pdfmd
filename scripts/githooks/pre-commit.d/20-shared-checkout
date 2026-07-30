@@ -20,6 +20,18 @@
 #   3. ALLOW_SHARED_COMMIT is unset.
 # An isolated worktree never trips this: git allows a feature branch in only one
 # worktree, so no sibling can be registered against the same toplevel on it.
+#
+# SELF-EXCLUSION (the load-bearing correctness property — never count yourself). A lock
+# is "self" if EITHER signal matches, so both must fail to misattribute:
+#   - session id: matched against CLAUDE_CODE_SESSION_ID — the var the harness actually
+#     exports into hook shells. (The pre-2026-06-27 code matched CLAUDE_SESSION_ID, which
+#     is NOT exported, so it never matched and fell back to a fragile count-minus-one that
+#     under-reported siblings and could fail open.) CLAUDE_SESSION_ID kept as a fallback.
+#   - pid ancestry: the registrar records the session's pid (the long-lived `claude`
+#     process); every commit in that session is its descendant, so that pid appears in
+#     this hook's process-ancestor chain. Covers surfaces where the env var is absent.
+# Corrupt-but-fresh locks can't be attributed to self, so they are counted as siblings
+# (fail CLOSED) rather than silently dropped. No count-minus-one anywhere.
 set -eu
 
 BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)
@@ -41,35 +53,69 @@ TOP=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 # Ask python to read the registry (same format/liveness as the collision hooks).
 # Prints the count of LIVE siblings (own session excluded) and their branches.
 SIBS=$(TOP="$TOP" python3 - <<'PY' 2>/dev/null || true
-import hashlib, json, os, time, glob
+import hashlib, json, os, time, glob, subprocess
 top = os.environ["TOP"]
 key = hashlib.sha1(top.encode()).hexdigest()[:16]
 d = os.path.join(os.path.expanduser("~"), ".claude", "checkout-locks", key)
 LIVE = 30 * 60
-me = os.environ.get("CLAUDE_SESSION_ID", "")  # excluded if the harness exports it
-n, branches = 0, []
+
+# --- Identify SELF, so we never count our own lock as a sibling. ---
+# (1) session id(s): CLAUDE_CODE_SESSION_ID is what the harness actually exports into
+#     hook shells; CLAUDE_SESSION_ID is a legacy fallback only.
+me_ids = set(v for v in (os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                         os.environ.get("CLAUDE_SESSION_ID")) if v)
+
+# (2) pid ancestry: walk our own process chain. The registrar recorded the session's
+#     pid, which is one of these ancestors for any commit made within that session.
+def _ancestors():
+    acc = set()
+    pid = os.getpid()
+    for _ in range(40):
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=3)
+            ppid = int(out.stdout.strip())
+        except Exception:
+            break
+        if ppid <= 1 or ppid in acc:
+            break
+        acc.add(ppid)
+        pid = ppid
+    return acc
+my_pids = _ancestors()
+
+live = []                 # (session_id, branch) for LIVE, NON-SELF entries
+unreadable_recent = 0     # corrupt locks too fresh to dismiss -> counted as siblings
 for f in glob.glob(os.path.join(d, "*.json")):
     sid = os.path.splitext(os.path.basename(f))[0]
-    if me and sid == me:
-        continue
     try:
-        e = json.load(open(f))
+        e = json.loads(open(f).read())
     except Exception:
-        e = {}
-    tp = e.get("transcript_path")
+        e = None
+    # Liveness: prefer the session transcript's mtime, else the lock file's own mtime.
     try:
+        tp = (e or {}).get("transcript_path")
         if tp and os.path.exists(tp):
-            live = (time.time() - os.path.getmtime(tp)) < LIVE
+            is_live = (time.time() - os.path.getmtime(tp)) < LIVE
         else:
-            live = (time.time() - os.path.getmtime(f)) < LIVE
+            is_live = (time.time() - os.path.getmtime(f)) < LIVE
     except Exception:
-        live = False
-    if live:
-        n += 1
-        if e.get("branch"):
-            branches.append(e["branch"])
-print(n)
-print(",".join(sorted(set(branches))))
+        is_live = False
+    if not is_live:
+        continue
+    if e is None:
+        # Corrupt + still fresh: cannot prove it is us, so do NOT let it vanish. Count it
+        # (fail CLOSED). With the atomic-writer fix this branch should not trigger.
+        unreadable_recent += 1
+        continue
+    # Self-exclusion: by session id OR by pid ancestry. Never count yourself.
+    if sid in me_ids or (e.get("session_id") in me_ids) or (e.get("pid") in my_pids):
+        continue
+    live.append((sid, e.get("branch")))
+
+count = len(live) + unreadable_recent
+print(count)
+print(",".join(sorted(set(b for _, b in live if b))))
 PY
 )
 
