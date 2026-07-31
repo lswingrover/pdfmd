@@ -17,7 +17,25 @@
 branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || exit 0
 [ -z "$branch" ] && exit 0
 case "$branch" in
-  main | master | staging | dev) exit 0 ;;
+  main | master | staging | dev)
+    # TRUNK COMMITS STILL GET AN OFF-MACHINE COPY — just not by publishing the trunk.
+    #
+    # Skipping trunks entirely was correct about one thing (a trunk should be pushed
+    # deliberately, not by a hook) and wrong about another: it left work committed
+    # directly to a trunk in a shared checkout with NO backup at all. On 2026-07-30 an
+    # audit found 12 such commits across three repos existing nowhere but this Mac —
+    # 10 of them a session's feature work — precisely because the safety net everyone
+    # relies on has a hole exactly where the shared-checkout risk is highest.
+    #
+    # So: mirror the trunk to refs/backup/<branch> instead. That is a real off-machine
+    # copy, it does NOT move origin/<trunk>, it does not open a PR or trigger CI, and it
+    # cannot trip pre-push.d/10-main-guard (which matches on the DESTINATION ref
+    # refs/heads/main, not on what is being pushed). Force-updated because it is a
+    # mirror of local state, not a branch anyone builds on.
+    #
+    # Recover with:  git fetch origin refs/backup/<branch>:refs/heads/rescue-<branch>
+    ( git push -f origin "HEAD:refs/backup/$branch" >/dev/null 2>&1 & ) >/dev/null 2>&1
+    exit 0 ;;
 esac
 
 # Background push; detach fully so the commit returns immediately and the hook
