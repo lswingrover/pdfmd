@@ -7,7 +7,7 @@
 # The universal base fragment is pre-push.d/10-main-guard (blocks direct origin/main
 # pushes unless ALLOW_MAIN_PUSH=1; PR-merge flow unaffected).
 #
-# Canonical source: lswingrover/scotty scripts/githooks/. AG_DEV_POLICY §14.4.
+# Canonical source: the scotty repo's scripts/githooks/. the personal dev-policy, Session isolation.
 # Activate once per clone: bash scripts/install-git-hooks.sh
 set -eu
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # post-commit: auto-publish the current branch to origin ("remote control").
 #
-# Part of the 1 branch = 1 worktree = 1 session model (AG_DEV_POLICY §14.4):
+# Part of the 1 branch = 1 worktree = 1 session model (the personal dev-policy, Session isolation):
 # every session's work is backed up to its own origin/<branch> the moment it is
 # committed, so nothing sits stranded in a local worktree (the failure mode that
 # nearly lost the person_contacts WIP on 2026-06-19).
