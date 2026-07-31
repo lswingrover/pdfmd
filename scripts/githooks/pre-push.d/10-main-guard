@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 10-main-guard — block a DIRECT push to origin/main (or master) ONLY when that trunk is
 # NOT this repo's default/integration branch — i.e. a dev→main promote repo where main is a
-# protected promote-only mirror (AG_DEV_POLICY §14.5). Repos that integrate ON main (most
+# protected promote-only mirror (the personal dev-policy, Session isolation). Repos that integrate ON main (most
 # personal repos) push to it normally. Override with ALLOW_MAIN_PUSH=1.
 # AG UNIVERSAL BASE check (byte-identical across repos; see CANONICAL.sha256).
 # PR-merge flow is unaffected — only direct local HEAD:main pushes are gated.
@@ -25,6 +25,6 @@ fi
 echo >&2
 echo "BLOCKED: direct push to a protected trunk from branch $BRANCH — this repo integrates on '$DEFAULT'." >&2
 echo "Open a PR / let the ship promote, or if intentional re-run with: ALLOW_MAIN_PUSH=1 git push ..." >&2
-echo "Guard keeps promote-only trunk pushes deliberate (AG_DEV_POLICY §14.4/§14.5)." >&2
+echo "Guard keeps promote-only trunk pushes deliberate (the personal dev-policy, Session isolation)." >&2
 echo >&2
 exit 1

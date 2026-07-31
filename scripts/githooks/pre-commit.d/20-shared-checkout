@@ -3,10 +3,10 @@
 # Claude/Cowork session also occupies (the "two sessions commit each other's work"
 # failure). AG UNIVERSAL BASE check (byte-identical across repos; see CANONICAL.sha256).
 #
-# Origin: prototyped in lswingrover/obrien #39 as a monolithic pre-commit; contributed
+# Origin: prototyped in the obrien repo (#39) as a monolithic pre-commit; contributed
 # up into the AG canonical dispatcher here as a fragment so it composes with the other
 # base checks and rides the same core.hooksPath install. Canonical source now:
-# lswingrover/scotty scripts/githooks/. AG_DEV_POLICY §14.4.
+# the scotty repo's scripts/githooks/. the personal dev-policy, Session isolation.
 #
 # Why git-native (not a Claude PreToolUse hook): the collision guard only fires on Bash
 # tool calls, so in Cowork — where git runs through the osascript MCP — commits are NOT
@@ -23,10 +23,12 @@
 #
 # SELF-EXCLUSION (the load-bearing correctness property — never count yourself). A lock
 # is "self" if EITHER signal matches, so both must fail to misattribute:
-#   - session id: matched against CLAUDE_CODE_SESSION_ID — the var the harness actually
-#     exports into hook shells. (The pre-2026-06-27 code matched CLAUDE_SESSION_ID, which
-#     is NOT exported, so it never matched and fell back to a fragile count-minus-one that
-#     under-reported siblings and could fail open.) CLAUDE_SESSION_ID kept as a fallback.
+#   - session id: DISCOVERED from the environment (any CLAUDE*SESSION* var holding an
+#     id-shaped value), not read from a hardcoded name. The pre-2026-06-27 code named
+#     CLAUDE_SESSION_ID, which the harness does not export — it exports
+#     CLAUDE_CODE_SESSION_ID — so self-exclusion silently never matched and every solo
+#     commit was false-blocked, in 14 of 21 repos, for a month. Naming the variable is
+#     the fragile part, so this no longer names it.
 #   - pid ancestry: the registrar records the session's pid (the long-lived `claude`
 #     process); every commit in that session is its descendant, so that pid appears in
 #     this hook's process-ancestor chain. Covers surfaces where the env var is absent.
@@ -60,10 +62,27 @@ d = os.path.join(os.path.expanduser("~"), ".claude", "checkout-locks", key)
 LIVE = 30 * 60
 
 # --- Identify SELF, so we never count our own lock as a sibling. ---
-# (1) session id(s): CLAUDE_CODE_SESSION_ID is what the harness actually exports into
-#     hook shells; CLAUDE_SESSION_ID is a legacy fallback only.
-me_ids = set(v for v in (os.environ.get("CLAUDE_CODE_SESSION_ID"),
-                         os.environ.get("CLAUDE_SESSION_ID")) if v)
+# (1) session id(s), DISCOVERED not hardcoded. Any env var whose name contains both
+#     CLAUDE and SESSION and whose value looks like an id counts as "me".
+#
+#     Why discovery rather than a name list: this guard has already been broken once by
+#     exactly this. The pre-2026-06-27 version read only CLAUDE_SESSION_ID, which the
+#     harness does not export — it exports CLAUDE_CODE_SESSION_ID — so self-exclusion
+#     silently never matched and every solo commit was false-blocked, in 14 of 21 repos,
+#     for a month. Naming the variable is the fragile part, so stop naming it.
+#
+#     Measured in a live hook shell 2026-07-30, this matches CLAUDE_CODE_SESSION_ID and
+#     CLAUDE_CODE_HOST_SESSION_ID (a parent session is self, not a contending sibling)
+#     while the id-shape filter rejects CLAUDE_CODE_CHILD_SESSION=true and any other
+#     flag-like value. A future rename that keeps either word keeps working.
+def _looks_like_session_id(v):
+    """Ids are long and opaque; flags are short words. Never match a boolean-ish value,
+    which could otherwise be compared against a real lock filename."""
+    return len(v) >= 8 and v.lower() not in ("true", "false", "yes", "no", "1", "0")
+
+me_ids = {v for k, v in os.environ.items()
+          if "CLAUDE" in k.upper() and "SESSION" in k.upper()
+          and v and _looks_like_session_id(v)}
 
 # (2) pid ancestry: walk our own process chain. The registrar recorded the session's
 #     pid, which is one of these ancestors for any commit made within that session.
@@ -116,6 +135,12 @@ for f in glob.glob(os.path.join(d, "*.json")):
 count = len(live) + unreadable_recent
 print(count)
 print(",".join(sorted(set(b for _, b in live if b))))
+# Third line: a self-identification diagnostic, printed ONLY when this hook is about to
+# block. If neither self-signal produced anything, the block may be the false-block bug
+# recurring (a renamed env var AND a process tree that hides the session pid) rather than
+# a real sibling — and the operator deserves to be told which, instead of being handed a
+# mystery block whose documented escape is the override that disables the guard.
+print("no-self-signal" if (not me_ids and not my_pids) else "")
 PY
 )
 
@@ -124,10 +149,18 @@ BRANCHES=$(printf '%s\n' "$SIBS" | sed -n '2p')
 [ -z "${COUNT:-}" ] && exit 0          # registry unreadable / no python — fail open
 [ "$COUNT" = "0" ] && exit 0           # no live siblings — allow
 
+SELFDIAG=$(printf '%s\n' "$SIBS" | sed -n '3p')
+
 NOTE=""
 [ -n "$BRANCHES" ] && NOTE=" (sibling branches: $BRANCHES)"
 echo >&2
 echo "BLOCKED: commit on '$BRANCH' — $COUNT other live Claude session(s) share this checkout$NOTE." >&2
+[ "$SELFDIAG" = "no-self-signal" ] && {
+  echo "  ⚠  Could not identify THIS session: no CLAUDE*SESSION* env var and no session pid in" >&2
+  echo "     this process's ancestry. Your own lock may be counted as a sibling — i.e. this" >&2
+  echo "     block may be spurious. Check the registry before overriding:" >&2
+  echo "       ls ~/.claude/checkout-locks/\$(python3 -c \"import hashlib,sys;print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])\" \"$TOP\")/" >&2
+}
 echo "  $TOP" >&2
 echo "Concurrent sessions in one working tree stage and commit each other's work." >&2
 echo "Isolate this session first:  bash scripts/session-worktree.sh $BRANCH" >&2
