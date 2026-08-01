@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""15-discreet-denylist — HARD-BLOCK commits that stage discreet / personal identifiers.
+
+Independent of gitleaks (10-secret-scan): gitleaks catches credential VALUES; this
+catches identifier LEAKS that are not secrets but must never reach an AG-distributed or
+mirror-synced artifact — the owner's private compartment names, personal launchd label,
+home path, RFC1918 topology, localhost:port gateway refs, and known gateway hosts.
+
+Scans STAGED blob content (git show :file) for every added/modified text file. Any hit
+aborts the commit (exit 1). Prints file + line + which class fired — never the matched
+value — so this hook itself never echoes the sensitive string.
+
+Skips: binary blobs and any line carrying a `denylist:ignore` pragma. NOTHING ELSE is
+exempt — not even this dir (see SKIP_PREFIXES). Adjacent/`+`-joined string literals are
+folded and re-scanned, so splitting a value to evade the scan does not work.
+Loud, explicit bypass for genuine exceptions:
+    OBRIEN_ALLOW_DENYLIST=1 git commit ...
+Root cause it guards: obrien.plugin shipped compartment names to the AG team (2026-07-15).
+"""
+import os
+import re
+import subprocess
+import sys
+
+PRAGMA = "denylist:ignore"
+
+# NO SENSITIVE VALUE IS STORED IN THIS FILE.
+#
+# Until 2026-07-23 the compartment tokens lived here, split into character literals so
+# this file would not trip its own scan. That defeated grep, not a reader — and this
+# repo mirrors in full to an org-visible destination, which is precisely the audience
+# the veil exists against. The owner's username and launchd label were embedded the
+# same way until 2026-07-28.
+#
+# The general rule (operating-principles.md, "A detector cannot hide its own secret"):
+# any scheme that lets a guard MATCH a secret lets a reader RECOVER it, because the
+# guard must be able to test candidates. Splitting, hashing and encoding are all
+# recoverable — a sibling repo's SHA-256 word-hashes fell to the stock system
+# dictionary in 0.13s. The only durable answer is that the value never enters the file.
+#
+# Values now load at runtime from an un-shipped local config. Absent (or partial)
+# config, the affected class is simply omitted and every other class still applies —
+# FAIL OPEN, so CI, foreign clones and teammates get a working guard carrying nothing.
+GUARD_CFG = os.path.expanduser("~/.config/claude-guards/compartments.json")
+
+
+def _cfg_values(key):
+    """Non-empty string values under `key` in the local guard config, else []."""
+    try:
+        import json
+        with open(GUARD_CFG) as fh:
+            return [v.strip() for v in (json.load(fh).get(key) or []) if v and v.strip()]
+    except Exception:
+        return []
+
+
+def _alternation(key, word_bounded=True):
+    """Compiled case-insensitive alternation over configured values, or None."""
+    vals = _cfg_values(key)
+    if not vals:
+        return None
+    # Escaped spaces become \s+ so a multi-word value still matches across a line
+    # break or doubled whitespace.
+    body = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in vals)
+    return re.compile((r"\b(?:%s)\b" if word_bounded else r"(?:%s)") % body, re.IGNORECASE)
+
+
+# (class label, compiled pattern). Structural patterns only — every value-bearing
+# class is loaded from config above. Nothing here names a compartment, a personal
+# login, a home path, or any other value this guard exists to catch.
+CHECKS = [
+    ("rfc1918-ip", re.compile(
+        r"\b(?:192\.168\.\d{1,3}\.\d{1,3}"
+        r"|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+        r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")),
+    ("loopback-bind", re.compile(r"\b127\.0\.0\.1(?::\d+)?\b")),
+    ("localhost-port", re.compile(r"\blocalhost:\d{2,5}\b")),
+    ("gateway-host", re.compile(r"starfleet-ambassador-group\.vercel\.app")),
+]
+
+def _this_repo_name():
+    """Canonical repo name for the tree being committed to, or '' if undeterminable.
+
+    `--show-toplevel` in a worktree returns the WORKTREE path, whose basename is
+    `<repo>-wt-<slug>`, not `<repo>`. Since every unit of work on this fleet happens in
+    a worktree (1 branch = 1 worktree = 1 session), naive basename matching would fail
+    to classify literally every real commit — arming the wrong tier in the one place it
+    is always read. Prefer the common dir, which points at the parent .git; fall back to
+    stripping the -wt- suffix.
+    """
+    try:
+        common = subprocess.run(["git", "rev-parse", "--path-format=absolute",
+                                 "--git-common-dir"], capture_output=True, text=True)
+        if common.returncode == 0 and common.stdout.strip():
+            # .../<repo>/.git  ->  <repo>
+            parent = os.path.dirname(common.stdout.strip().rstrip("/"))
+            if parent:
+                return os.path.basename(parent)
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True)
+        name = os.path.basename(r.stdout.strip()) if r.returncode == 0 else ""
+        return name.split("-wt-")[0]
+    except Exception:
+        return ""
+
+
+_REPO = _this_repo_name()
+
+# TWO TIERS. The compartment class runs in every repo; the owner/personal classes run
+# only in repos that build a DISTRIBUTED artifact, listed under `distributing_repos` in
+# the guard config.
+#
+# Why, measured 2026-07-31 when this hook was vendored beyond obrien for the first time:
+# with all three classes armed everywhere, 375 tracked files across 27 repos would have
+# refused to commit on touch — 49 of MacWatch's 110, 15 of 28 in another. That is not a
+# gate, it is a work stoppage, and this hook's own docstring already warns that blanket
+# pragma-papering "does not scale and trains people to add one reflexively instead of
+# reading the hit". The compartment class alone: 48 files, and all 48 are real.
+#
+# The asymmetry is not a compromise, it is the actual threat model. A compartment name
+# is a veil breach wherever it lands, because the veil is about WHO MAY KNOW a thing
+# exists. The owner's own username in his own private repo is not a breach at all — a
+# ship skill must name <owner>/<repo> to clone it, and a macOS bundle identifier
+# legitimately contains it. It becomes a breach only in something that ships.
+#
+# Absent the key, only the compartment class arms. That default is deliberate: a repo
+# nobody has classified is a repo whose audience nobody has thought about, and the
+# quiet failure there should be under-blocking a private repo, not stopping every
+# commit in it.
+_DISTRIBUTING = {v.lower() for v in _cfg_values("distributing_repos")}
+_ARMED = (("compartment-name", "compartment_tokens", True),) + (
+    (("personal-identifier", "personal_tokens", False),
+     ("owner-name", "owner_name_tokens", True))
+    if _REPO.lower() in _DISTRIBUTING else ()
+)
+
+# A repo never denies its own subject: it would flag its own business data on every
+# commit. Same rule as install_preflight_conf.py, and for the same reason.
+#
+# TWO SOURCES, and the second one is why this comment exists. Inferring the subject
+# from the directory name covers the easy case (a compartment's own repo) and MISSES
+# every repo that legitimately owns a compartment's work under a different name — a
+# ship plugin, a tooling repo, an archive. That case must be recorded explicitly, per
+# repo, under `own_subject_extra` in the guard config, so the exemption is auditable
+# and narrow rather than a blanket bypass.
+#
+# Shipped 2026-08-01 with only the name-based half wired up, which blocked a commit in
+# exactly the repo the owner had already sanctioned. The lesson is the general one: two
+# consumers of the same config (this hook and install_preflight_conf.py) drift the
+# moment one of them learns something the other does not.
+def _own_subject_tokens():
+    tokens = [t for t in _cfg_values("compartment_tokens") if t.lower() in _REPO.lower()]
+    try:
+        import json
+        with open(GUARD_CFG) as fh:
+            extra = (json.load(fh).get("own_subject_extra") or {}).get(_REPO) or []
+        tokens += [t for t in extra if isinstance(t, str) and t.strip()]
+    except Exception:
+        pass
+    return tokens
+
+
+_OWN = _own_subject_tokens()
+
+for _label, _key, _wb in _ARMED:
+    _vals = [v for v in _cfg_values(_key) if v not in _OWN]
+    if not _vals:
+        continue
+    _body = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in _vals)
+    _pat = re.compile((r"\b(?:%s)\b" if _wb else r"(?:%s)") % _body, re.IGNORECASE)
+    CHECKS.insert(0, (_label, _pat))
+
+# WHAT MAY BE EXEMPTED — and the one thing that never may.
+#
+# NEVER exempt the guard's own rule files. This tuple once held ("scripts/githooks/",)
+# so the guard could not police itself — and that exemption was load-bearing for the
+# 2026-07-15 leak, because the rule files were exactly where the tokens hid. Every value
+# is config-sourced now, so those files contain nothing to hide and the guard scans
+# itself. Re-adding a self-exemption would recreate the original hole.
+#
+# What IS legitimate to skip is a different question: paths the build NEVER PACKAGES.
+# An identifier there cannot reach a recipient, because nothing carries it to one. This
+# narrows WHERE the scanner looks, never WHAT it looks for — dropping a token from the
+# guard config to quieten a hit would silently reopen the leak that token closed.
+#
+# Why this exists (2026-07-30): adding the owner's GitHub namespace to the config — after
+# the bundle gate was caught passing `<owner>/<repo>` into the shipped plugin — made the
+# hook fire on legitimate self-references: a README citing its own clone URL, a build
+# comment recording provenance, an internal audit doc quoting real history. Those were
+# papered over with per-line `denylist:ignore` pragmas, which does not scale and trains
+# people to add one reflexively instead of reading the hit. Per-line pragmas remain the
+# right tool for a ONE-OFF exception in a file that DOES ship.
+#
+# build_obrien_plugin.py is the authority on what ships — keep this in step with it. A
+# path listed here that later STARTS shipping becomes a hole, and that is not
+# hypothetical: scripts/githooks/ began shipping on 2026-07-31 (#113). Prefer
+# under-listing; when unsure, leave it scanned.
+SKIP_PREFIXES = (
+    "build/",             # build tooling; not packaged
+    "docs/internal/",     # explicitly excluded from the package
+    "tests/",             # never packaged
+    "README",             # repo-facing; the plugin ships its own docs/
+    "CONTRIBUTING",       # repo-facing
+)
+
+
+_CONCAT = re.compile(r'(["\'])([^"\'\n]*)\1\s*\+?\s*[rbf]{0,2}(["\'])([^"\'\n]*)\3')
+
+
+def collapse_concats(line):
+    """Fold adjacent / `+`-joined string literals into one, so a value hidden by
+    splitting is scanned in its reconstructed form.
+
+    This is what makes the no-values-in-the-guard rule self-enforcing. Config-sourcing
+    removed the values, and dropping SKIP_PREFIXES made the guard scan its own rule
+    files — but neither catches the ORIGINAL evasion, which was to spell a value out as
+    `"s" "e" "c" ...` or `r"com\\." + "<name>"`. Those defeat a literal scan by
+    construction. Reconstructing first means splitting buys nothing, which is the whole
+    point: a detector cannot hide its own secret, so stop letting anyone try.
+
+    Applied in ADDITION to the raw line (never instead of it) — folding could in
+    principle mask a match that spans a quote boundary. Bounded loop; no regex
+    backtracking risk on pathological input.
+    """
+    prev = None
+    for _ in range(12):                       # converges well before this on real source
+        if line == prev:
+            break
+        prev = line
+        line = _CONCAT.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(4)}{m.group(1)}", line)
+    return line
+
+
+def staged_files():
+    out = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM", "-z"],
+        capture_output=True, text=True,
+    ).stdout
+    return [p for p in out.split("\0") if p]
+
+
+def staged_blob(path):
+    r = subprocess.run(["git", "show", f":{path}"], capture_output=True)
+    if r.returncode != 0:
+        return None
+    raw = r.stdout
+    if b"\x00" in raw[:8192]:          # binary — skip
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
+def main():
+    # Require an explicit affirmative value. A bare truthiness test accepted ANY
+    # non-empty string — so `OBRIEN_ALLOW_DENYLIST=0`, which reads as "do not allow",
+    # silently BYPASSED the gate. That is the worst possible failure direction for a
+    # guard: the operator believes they disabled the bypass and instead disabled the
+    # check. Hit for real on 2026-07-29.
+    _bypass = os.environ.get("OBRIEN_ALLOW_DENYLIST", "").strip().lower()
+    if _bypass in ("1", "true", "yes"):
+        print("pre-commit[discreet-denylist]: BYPASSED via OBRIEN_ALLOW_DENYLIST",
+              file=sys.stderr)
+        return 0
+    if _bypass:
+        print(f"pre-commit[discreet-denylist]: OBRIEN_ALLOW_DENYLIST={_bypass!r} is not "
+              f"an affirmative value — gate STAYS ACTIVE. Use 1/true/yes to bypass.",
+              file=sys.stderr)
+
+    violations = []
+    for path in staged_files():
+        if any(path.startswith(p) for p in SKIP_PREFIXES):
+            continue
+        text = staged_blob(path)
+        if text is None:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if PRAGMA in line:
+                continue
+            folded = collapse_concats(line)
+            for label, pat in CHECKS:
+                if pat.search(line):
+                    violations.append((path, lineno, label))
+                elif folded != line and pat.search(folded):
+                    violations.append((path, lineno, label + " (split literal)"))
+
+    if violations:
+        print("\npre-commit[discreet-denylist]: BLOCKED — staged content contains "
+              "discreet/personal identifiers that must never ship or mirror:", file=sys.stderr)
+        for path, lineno, label in violations:
+            print(f"  {path}:{lineno}  [{label}]", file=sys.stderr)
+        print("\nScrub the value (config-source it / genericize it) before committing.", file=sys.stderr)
+        print("Genuine exception (rare): OBRIEN_ALLOW_DENYLIST=1 git commit ...", file=sys.stderr)
+        print("Per-line exception: add a `denylist:ignore` pragma to that line.\n", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
