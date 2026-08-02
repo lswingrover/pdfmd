@@ -479,5 +479,115 @@ def main():
     return 0
 
 
+# ── SWEEP MODE ──────────────────────────────────────────────────────────────────────
+# "Which repos would adding this token make uncommittable?" Today you find that out one
+# blocked commit at a time — which is how two repos' exemptions were discovered.
+#
+# WHY THIS LIVES IN THE HOOK AND NOT IN A SEPARATE SCRIPT. A sibling built exactly this
+# externally, twice, and got it wrong the first time: it reported 6 repos would block when
+# the true answer was 1. The reimplementation missed name-based own-subject inference,
+# own_subject_extra, SKIP_PREFIXES, and the binary skip — four behaviours that all live
+# here. Any external caller re-derives this matching logic and drifts from it, and a sweep
+# that is confidently wrong is worse than no sweep, because its whole purpose is to be
+# believed before someone changes config.
+#
+# HOW IT STAYS HONEST: --sweep re-executes THIS FILE once per repo with that repo as cwd.
+# Every per-repo decision — _REPO, _ARMED, _OWN, _SCOPED, the compiled CHECKS — is
+# computed at import against the current working tree, so a subprocess per repo gets them
+# right by construction rather than by reimplementation. The only substitutions are the
+# two that make it a survey instead of a commit gate:
+#     staged_files() -> tracked files      (git ls-files, not the index diff)
+#     added_lines()  -> None               (judge the whole blob, as fail-closed already does)
+#
+# Output is `repo<TAB>path<TAB>label`, so it pipes into the fleet audit and into cut/sort.
+# Exit is ALWAYS 0: this reports, it never blocks.
+def tracked_files():
+    out = subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True).stdout
+    # `git ls-files` names a DIRECTORY when a submodule gitlink is present, which crashes
+    # a naive open(). Filter to real files rather than trusting the listing.
+    return [q for q in out.split("\0") if q and os.path.isfile(q)]
+
+
+def tracked_blob(path):
+    """Working-tree content, or None for binary/unreadable.
+
+    Deliberately the working tree, not HEAD: the question this answers is "what would
+    block if I committed what is here", and that is disk content.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except Exception:
+        return None
+    if b"\x00" in raw[:8192]:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def sweep_one():
+    """Survey THIS repo (cwd). Prints repo\tpath\tlabel. Always returns 0."""
+    repo = _REPO or os.path.basename(os.getcwd())
+    for path in tracked_files():
+        if any(path.startswith(pref) for pref in SKIP_PREFIXES):
+            continue
+        text = tracked_blob(path)
+        if text is None:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if PRAGMA in line:
+                continue
+            folded = collapse_concats(line)
+            for label, pat in _checks_for(path):
+                if pat.search(line) or (folded != line and pat.search(folded)):
+                    print(f"{repo}\t{path}:{lineno}\t{label}")
+                    break
+    return 0
+
+
+def sweep(repos):
+    """Re-exec this file once per repo, with that repo as cwd. See the note above."""
+    dev = os.environ.get("DEV_ROOT", os.path.expanduser("~/Developer"))
+    if not repos:
+        repos = sorted(
+            os.path.join(dev, d) for d in os.listdir(dev)
+            if os.path.isdir(os.path.join(dev, d, ".git")) and "-wt-" not in d
+            and not d.startswith("_archive")
+        )
+    # SAY WHAT THIS IS, on the output, every run.
+    #
+    # The sweep judges the WHOLE BLOB; a real commit judges only the lines it ADDS
+    # (added_lines(), scotty#74). So a row here means "this file CONTAINS a value", not
+    # "your next commit will block" — editing an unrelated line in one of these files is
+    # fine. Over-reporting is the correct direction for a planning tool, but only if it
+    # is labelled, or someone reads a 27-row repo as 27 broken commits.
+    print("# denylist --sweep: repo\tpath:line\tclass", file=sys.stderr)
+    print("# WHOLE-BLOB survey. A row = this file CONTAINS a matching value. A real commit"
+          " judges only ADDED lines, so this is an upper bound, not a prediction.",
+          file=sys.stderr)
+    rc = 0
+    for r in repos:
+        r = os.path.abspath(os.path.expanduser(r))
+        if not os.path.isdir(os.path.join(r, ".git")):
+            print(f"sweep: not a git repo, skipped: {r}", file=sys.stderr)
+            continue
+        res = subprocess.run([sys.executable, os.path.abspath(__file__), "--sweep-one"],
+                             cwd=r, capture_output=True, text=True)
+        sys.stdout.write(res.stdout)
+        if res.returncode != 0:
+            # Never silent: a repo that failed to survey is not a repo with no hits.
+            print(f"sweep: FAILED to survey {os.path.basename(r)} "
+                  f"(rc={res.returncode}): {res.stderr.strip()[:200]}", file=sys.stderr)
+            rc = 2
+    return rc
+
+
 if __name__ == "__main__":
+    if "--sweep-one" in sys.argv:
+        sys.exit(sweep_one())
+    if "--sweep" in sys.argv:
+        i = sys.argv.index("--sweep")
+        sys.exit(sweep([a for a in sys.argv[i + 1:] if not a.startswith("-")]))
     sys.exit(main())
