@@ -62,6 +62,38 @@ def _cfg_values(key):
         return []
 
 
+# WORD BOUNDARIES HERE ARE NOT `\b`, DELIBERATELY, AND THAT IS THE WHOLE POINT.
+#
+# `\b` sits between a word character and a non-word character — and `_` IS a word
+# character. So a configured value embedded in an underscore-joined identifier has
+# no boundary on either side and never matches:
+#
+#     FOO_<value>_PATH = "..."      <- `\b` finds NOTHING here
+#
+# That is the single most common shape residue actually takes (module-level path
+# constants, ALL-CAPS env names, generated identifiers). Measured across four repos
+# on 2026-08-02: this class read 0 with `\b` in a repo where a substring pass found
+# 5, and every one of the five sat inside an ALL-CAPS underscore-joined name. The
+# hook reported the tree clean.
+#
+# `_WB_L`/`_WB_R` define the boundary as "not adjacent to an ALPHANUMERIC" instead.
+# Strictly wider than `\b`, never narrower:
+#
+#     FOO_val_BAR   -> matches   (`_` is not alphanumeric)   <- was missed
+#     val.example   -> matches   (`.` is not alphanumeric)   <- was missed
+#     val-joined    -> matches   (`-` is not alphanumeric)   <- was missed
+#     validation    -> no match  (`i` is alphanumeric)       <- still excluded
+#
+# Deliberately NOT a bare substring: a guard's false-positive rate is a security
+# property, because a gate that cries wolf trains people to reach for the bypass.
+#
+# The structural classes below (rfc1918-ip, loopback-bind, localhost-port) keep
+# their own `\b` anchors — those match numeric/punctuated literals where `\b`
+# behaves correctly, and widening them would fire inside version strings.
+_WB_L = r"(?<![A-Za-z0-9])"
+_WB_R = r"(?![A-Za-z0-9])"
+
+
 def _alternation(key, word_bounded=True):
     """Compiled case-insensitive alternation over configured values, or None."""
     vals = _cfg_values(key)
@@ -70,7 +102,8 @@ def _alternation(key, word_bounded=True):
     # Escaped spaces become \s+ so a multi-word value still matches across a line
     # break or doubled whitespace.
     body = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in vals)
-    return re.compile((r"\b(?:%s)\b" if word_bounded else r"(?:%s)") % body, re.IGNORECASE)
+    fmt = (_WB_L + r"(?:%s)" + _WB_R) if word_bounded else r"(?:%s)"
+    return re.compile(fmt % body, re.IGNORECASE)
 
 
 # (class label, compiled pattern). Structural patterns only — every value-bearing
@@ -262,8 +295,12 @@ def _own_subject_spec():
 _OWN, _SCOPED = _own_subject_spec()
 
 def _compile_alt(vals, word_bounded):
+    # Same non-alphanumeric boundary as _alternation — see the block comment there.
+    # These two must stay in step: this one rebuilds the per-path variants, so a
+    # `\b` here would silently restore the blind spot for every path-scoped class.
     body = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in vals)
-    return re.compile((r"\b(?:%s)\b" if word_bounded else r"(?:%s)") % body, re.IGNORECASE)
+    fmt = (_WB_L + r"(?:%s)" + _WB_R) if word_bounded else r"(?:%s)"
+    return re.compile(fmt % body, re.IGNORECASE)
 
 
 # Keep each value-bearing class's raw values so a per-path variant can be rebuilt. A
