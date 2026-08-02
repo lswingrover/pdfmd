@@ -527,9 +527,44 @@ def tracked_blob(path):
         return None
 
 
+def _sweep_basis():
+    """(branch, short-sha, behind-count-or-None) for the tree being surveyed.
+
+    The sweep reads the WORKING TREE, so it answers for whatever branch this checkout
+    happens to be parked on. A repo mid-feature reports its feature state; a repo on a
+    stale branch reports history. Neither is the thing anyone is deciding about, and
+    both look identical to a real hit. Reported after a sibling's first real run
+    produced 11 rows of which most were phantoms from a checkout 7 commits behind its
+    own main, on a feature branch where a file they had already cleared still had 17
+    hits. Same defect the fleet audit had: a tool that will not name its own basis
+    cannot be told apart from a tool that is wrong.
+    """
+    def _q(args):
+        r = subprocess.run(args, capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    branch = _q(["git", "symbolic-ref", "--quiet", "--short", "HEAD"]) or "DETACHED"
+    sha = _q(["git", "rev-parse", "--short", "HEAD"]) or "?"
+    behind = None
+    up = _q(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    if up:
+        n = _q(["git", "rev-list", "--count", "HEAD..@{u}"])
+        if n.isdigit():
+            behind = int(n)
+    return branch, sha, behind
+
+
 def sweep_one():
     """Survey THIS repo (cwd). Prints repo\tpath\tlabel. Always returns 0."""
     repo = _REPO or os.path.basename(os.getcwd())
+    _branch, _sha, _behind = _sweep_basis()
+    print(f"# {repo}@{_branch}@{_sha}", file=sys.stderr)
+    if _behind:
+        print(f"#   \u26a0 {repo} is {_behind} commit(s) BEHIND its upstream — rows below "
+              f"describe THIS CHECKOUT, not the repo. Pull before trusting them.",
+              file=sys.stderr)
+    if _branch not in ("main", "master", "dev", "staging", "trunk", "DETACHED"):
+        print(f"#   \u26a0 {repo} is on feature branch '{_branch}' — rows below describe that "
+              f"branch's state, not the default branch anyone will clone.", file=sys.stderr)
     for path in tracked_files():
         if any(path.startswith(pref) for pref in SKIP_PREFIXES):
             continue
@@ -567,6 +602,10 @@ def sweep(repos):
     print("# WHOLE-BLOB survey. A row = this file CONTAINS a matching value. A real commit"
           " judges only ADDED lines, so this is an upper bound, not a prediction.",
           file=sys.stderr)
+    print("# Rows describe each repo's WORKING TREE at the branch shown in its '# repo@branch@sha'"
+          " line. For a repo that SHIPS an artifact, the question that decides severity is whether"
+          " the ARTIFACT carries the value, not the repo: validating one repo's built plugin found"
+          " 1 deliberate carrier against 12 repo-level rows, a 12:1 over-report.", file=sys.stderr)
     rc = 0
     for r in repos:
         r = os.path.abspath(os.path.expanduser(r))
@@ -576,6 +615,13 @@ def sweep(repos):
         res = subprocess.run([sys.executable, os.path.abspath(__file__), "--sweep-one"],
                              cwd=r, capture_output=True, text=True)
         sys.stdout.write(res.stdout)
+        # FORWARD the child's stderr. It carries the per-repo basis line and the
+        # behind/feature-branch warnings — the whole point of which is that the reader
+        # sees them. Capturing and dropping it made this function silently discard its
+        # own diagnostics, which is the same muting defect the fleet has been chasing
+        # all day, committed inside the tool built to expose it.
+        if res.stderr:
+            sys.stderr.write(res.stderr)
         if res.returncode != 0:
             # Never silent: a repo that failed to survey is not a repo with no hits.
             print(f"sweep: FAILED to survey {os.path.basename(r)} "
