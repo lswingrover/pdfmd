@@ -194,13 +194,33 @@ if _REPO.lower() in _DISTRIBUTING:
 # granularity is the right one, and `SKIP_PREFIXES` already encodes the same idea in
 # hook code.
 #
-# Config accepts both forms; the list form stays repo-wide so existing entries keep
-# working, and is the one to migrate away from:
-#     "own_subject_extra": {
-#       "repo-a": ["tok"],                                    # repo-wide (legacy)
-#       "repo-b": {"tokens": ["tok"], "paths": ["src/", "scripts/"]}
-#     }
-# A dict with no "paths" is also repo-wide — explicitly, rather than by omission.
+# TWO CONFIG SHAPES, and the second one exists because the first is a footgun ACROSS
+# VERSIONS. A sibling session verified this against the deployed hook rather than
+# theorising it:
+#
+#   "own_subject_extra": {"repo": {"tokens": [...], "paths": [...]}}
+#
+# is parsed by every PRE-scoping copy as `[t for t in extra if isinstance(t, str)]` —
+# and iterating a dict yields its KEYS. So an old copy exempts the literal strings
+# "tokens" and "paths", matches no real token, and the exemption silently evaporates.
+# It fails CLOSED (the commit blocks) rather than leaking, which is the safe direction,
+# but it blocks with no clue why — and the fleet always contains copies older than
+# canonical, so "just update the hook first" is a migration order somebody will get
+# wrong exactly once.
+#
+# THE FIX IS SHAPE, NOT SEQUENCING. Paths live under a separate top-level key:
+#
+#     "own_subject_extra": { "repo-b": ["tok"] },          <- unchanged; old code fine
+#     "own_subject_paths": { "repo-b": ["src/", "scripts/"] }
+#
+# An old copy never sees `own_subject_paths`, reads the list exactly as it always did,
+# and keeps its previous repo-wide behaviour — safe, and identical to today. A new copy
+# reads both and narrows the exemption to those paths. **Config written the new way is
+# therefore safe to deploy BEFORE the hook is vendored**, which removes the ordering
+# constraint rather than documenting it.
+#
+# The inline dict form is still accepted for anything already written that way, but the
+# two-key form is what to use.
 def _own_subject_spec():
     """(repo_wide_tokens, [(path_prefix_tuple, token_set), ...]) for this repo."""
     wide = [t for t in _cfg_values("compartment_tokens") if t.lower() in _REPO.lower()]
@@ -214,12 +234,28 @@ def _own_subject_spec():
     if isinstance(entry, list):
         wide += [t for t in entry if isinstance(t, str) and t.strip()]
     elif isinstance(entry, dict):
+        # Accepted, but see the hazard note above — prefer the two-key form.
         toks = [t for t in (entry.get("tokens") or []) if isinstance(t, str) and t.strip()]
-        paths = [p for p in (entry.get("paths") or []) if isinstance(p, str) and p.strip()]
+        paths = [q for q in (entry.get("paths") or []) if isinstance(q, str) and q.strip()]
         if toks and paths:
             scoped.append((tuple(paths), set(toks)))
         elif toks:
             wide += toks
+
+    # THE SAFE FORM: paths live under their OWN key, so old code never sees a shape it
+    # cannot parse. `own_subject_extra` keeps holding a plain list — exactly what every
+    # deployed copy already expects — and the scoping is additive.
+    try:
+        import json
+        with open(GUARD_CFG) as fh:
+            pth = (json.load(fh).get("own_subject_paths") or {}).get(_REPO) or []
+    except Exception:
+        pth = []
+    pth = [q for q in pth if isinstance(q, str) and q.strip()]
+    if pth and wide:
+        # Tokens named repo-wide become PATH-SCOPED once paths are declared for the repo.
+        scoped.append((tuple(pth), set(wide)))
+        wide = [t for t in wide if t.lower() in _REPO.lower()]   # keep the name-derived half
     return wide, scoped
 
 
