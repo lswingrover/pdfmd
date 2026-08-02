@@ -3,10 +3,11 @@
 # (the PERSONAL-fleet source of truth) into THIS repo, then activate it. Run once per
 # clone; re-run to update. Pin SCOTTY_GITHOOKS_REF to a tag/SHA for reproducibility.
 #
-# scotty mirrors laforge's framework (AG_DEV_POLICY §14.4) but is the source for
-# PERSONAL repos, so the personal tree stays self-contained and doesn't depend on
-# access to the private ambassador-group org. (laforge is the source for AG repos.)
-# Personal-tree doctrine mirror: operating-principles.md § Branch-state discipline.
+# scotty is the source of truth for this fleet's hooks. Keeping the canonical set here
+# means the tree is self-contained: no repo needs access to any other organisation to
+# install its own guards. That independence was won, not given — the previous source
+# lived behind a private org, so losing access to it would have broken every install.
+# Doctrine mirror: operating-principles.md § Branch-state discipline.
 #
 # Why vendor (not hand-copy): one source of truth in scotty/scripts/githooks/ — no
 # drift across repos. Why this set: composable dispatchers (pre-commit / pre-push run
@@ -41,10 +42,44 @@ if [ -z "${VENDOR_GITHOOKS_SELF:-}" ]; then
 fi
 trap 'rm -f "${VENDOR_GITHOOKS_SELF:-}"' EXIT
 
-# Irreducible: a vendoring script must name the repo it vendors FROM, and this is
-# already the config-sourced form ($SCOTTY_REPO wins). Override to re-point the
-# fleet at a different source. dev-policy.md §8b exemption.
-SRC_REPO="${SCOTTY_REPO:-lswingrover/scotty}"  # denylist:ignore — see comment above
+# WHERE THE CANONICAL HOOKS COME FROM — configured, never committed.
+#
+# This was `${SCOTTY_REPO:-<owner>/scotty}` carrying a per-line denylist:ignore. The
+# commit hook honoured that pragma; the plugin BUILD gate did not, and the build gate
+# was right. This file ships inside a plugin that gets given away, so a baked-in
+# default points a recipient's vendoring at somebody else's repository — they would
+# either pull hooks from an account they have nothing to do with, or get a 404 with no
+# way to interpret it. "Irreducible" was the wrong call: what is irreducible is that
+# the script needs A source, not that the source is spelled out here.
+#
+# Resolution order (dev-policy.md §8b):
+#   1. $SCOTTY_REPO                    — explicit override, wins
+#   2. ~/.config/githooks/source-repo  — one line, "<owner>/<repo>"
+#   3. hard error naming exactly what to set
+#
+# Deliberately NO default. A wrong default is worse than none here: it fails in the one
+# direction nobody checks — successfully vendoring the wrong thing, quietly.
+_cfg_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+SRC_REPO="${SCOTTY_REPO:-}"
+if [ -z "$SRC_REPO" ] && [ -r "$_cfg_home/githooks/source-repo" ]; then
+  SRC_REPO=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$_cfg_home/githooks/source-repo" | grep -v '^$' | head -1)
+fi
+if [ -z "$SRC_REPO" ]; then
+  cat >&2 <<ERR
+vendor-githooks: no canonical hook source configured.
+
+  Set one of:
+    export SCOTTY_REPO="<owner>/<repo>"
+  or write it once:
+    mkdir -p "$_cfg_home/githooks"
+    echo "<owner>/<repo>" > "$_cfg_home/githooks/source-repo"
+
+  <owner>/<repo> is the GitHub repo holding the canonical scripts/githooks/ set.
+  There is deliberately no default: vendoring from the wrong repo would succeed
+  quietly, which is the one failure mode a guard-installer must not have.
+ERR
+  exit 1
+fi
 REF="${SCOTTY_GITHOOKS_REF:-main}"          # pin to a tag/SHA for reproducible vendoring
 SUBPATH="scripts/githooks"
 # Vendored alongside the hooks so the dispatcher base + universal fragments + the

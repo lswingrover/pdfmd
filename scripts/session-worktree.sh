@@ -5,7 +5,7 @@
 # Why: concurrent sessions in one checkout race each other — parallel rebuilds,
 # clobbered uncommitted work, HEAD moving underneath. A worktree gives this session
 # its own working dir + index + HEAD while sharing the object store. See
-# AG_DEV_POLICY.md §14.4 (Shared-Checkout & Worktree Discipline) and
+# dev-policy.md §2 (Session isolation) and
 # ~/Documents/Claude/preferences/operating-principles.md § Branch-state discipline.
 #
 # This is the FULL bootstrap: it doesn't just `git worktree add`, it makes the new
@@ -71,12 +71,16 @@ SBR=$(printf '%s' "$BRANCH" | tr '/' '-')
 
 # --- Resolve this repo's integration branch as a remote-tracking ref (origin/<branch>) ---
 # origin/HEAD is the WRONG signal on this fleet: it mirrors the remote's DEFAULT branch (main),
-# but dev-first repos (laforge/riker/obrien) integrate on 'dev'. Resolve, in order: (1) explicit
-# override git config ag.integrationBranch; (2) first EXISTING of origin/dev, origin/staging
+# but dev-first repos integrate on 'dev'. Resolve, in order: (1) explicit
+# override git config session.integrationBranch; (2) first EXISTING of origin/dev, origin/staging
 # (exact refs); (3) origin/HEAD. Kept byte-identical to new-session.sh — resolve once, both paths.
 resolve_base_ref() {
   local d="${1:-.}" cfg cand def
-  cfg=$(git -C "$d" config --get ag.integrationBranch 2>/dev/null || true)
+  cfg=$(git -C "$d" config --get session.integrationBranch 2>/dev/null || true)
+  # Legacy key, read-only fallback. Renamed 2026-08-02 to drop an org prefix from a
+  # generic setting; no repo on this fleet sets either, but a clone elsewhere might, and
+  # silently ignoring a config someone set is worse than carrying two lines.
+  [ -z "${cfg:-}" ] && cfg=$(git -C "$d" config --get ag.integrationBranch 2>/dev/null || true)
   if [ -n "$cfg" ] && git -C "$d" show-ref --verify --quiet "refs/remotes/origin/$cfg"; then
     printf 'origin/%s\n' "$cfg"; return 0
   fi

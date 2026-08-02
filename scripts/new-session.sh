@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # new-session.sh <slug> — turnkey session isolation, descriptively named & matching.
 #
-# The operating model (AG_DEV_POLICY §14.4): 1 branch = 1 worktree = 1 session,
+# The operating model (dev-policy.md §2): 1 branch = 1 worktree = 1 session,
 # with remote control. The <slug> is the ONE descriptive name shared by your
 # session title, your branch, and your worktree — so the three always match and
 # anyone can tell what each is at a glance. No random codenames.
 #
 # This one command:
 #   - creates branch <slug> + matching worktree ../<repo>-wt-<slug> off this repo's
-#     integration branch (dev in laforge/riker/obrien, staging in enterprise-d, else the
+#     integration branch (dev in some repos, staging in others, else the
 #     remote default) — resolved by resolve_base_ref(), NOT origin/HEAD, which mirrors the
 #     remote default (main) and is wrong for the dev-first repos.
 #   - copies .env essentials + links deps (immediately runnable)
@@ -25,14 +25,19 @@ ROOT=$(git rev-parse --show-toplevel) || { echo "new-session: not in a git repo"
 
 # --- Resolve this repo's integration branch as a remote-tracking ref (origin/<branch>) ---
 # origin/HEAD is the WRONG signal on this fleet: it mirrors the remote's DEFAULT branch
-# (main), but the dev-first repos (laforge/riker/obrien) integrate on 'dev' while origin/HEAD
+# (main), but the dev-first repos integrate on 'dev' while origin/HEAD
 # still points at main — so basing a worktree on origin/HEAD strands it on main in exactly
 # the repos that ship dev-first. Resolve, in order: (1) explicit override git config
-# ag.integrationBranch; (2) convention — first EXISTING of origin/dev, origin/staging (exact
-# refs; no fleet repo has both, so dev-first->dev, enterprise-d->staging); (3) origin/HEAD.
+# session.integrationBranch; (2) convention — first EXISTING of origin/dev, origin/staging
+# (exact refs; no fleet repo has both, so a dev-first repo resolves to dev and a
+# staging-first repo to staging); (3) origin/HEAD.
 resolve_base_ref() {
   local d="${1:-.}" cfg cand def
-  cfg=$(git -C "$d" config --get ag.integrationBranch 2>/dev/null || true)
+  cfg=$(git -C "$d" config --get session.integrationBranch 2>/dev/null || true)
+  # Legacy key, read-only fallback. Renamed 2026-08-02 to drop an org prefix from a
+  # generic setting; no repo on this fleet sets either, but a clone elsewhere might, and
+  # silently ignoring a config someone set is worse than carrying two lines.
+  [ -z "${cfg:-}" ] && cfg=$(git -C "$d" config --get ag.integrationBranch 2>/dev/null || true)
   if [ -n "$cfg" ] && git -C "$d" show-ref --verify --quiet "refs/remotes/origin/$cfg"; then
     printf 'origin/%s\n' "$cfg"; return 0
   fi
@@ -53,7 +58,7 @@ usage: bash scripts/new-session.sh <kebab-slug>
 
   <kebab-slug> describes your task in lowercase-with-dashes. It becomes your
   session title, branch name, AND worktree name (so all three match). Examples:
-    gmail-gcal-oauth    crelate-migration-people    schema-migrations-review
+    add-oauth-refresh   migrate-people-records      schema-migrations-review
 EOF
   exit 2
 fi
@@ -83,7 +88,7 @@ git fetch origin --quiet
 base_ref=$(resolve_base_ref "$ROOT") || base_ref=""
 if [ -z "$base_ref" ]; then
   echo "new-session: cannot resolve an integration branch (no origin/dev, origin/staging, or origin/HEAD)." >&2
-  echo "  set one explicitly:  git config ag.integrationBranch <branch>   (or: git remote set-head origin -a)" >&2
+  echo "  set one explicitly:  git config session.integrationBranch <branch>   (or: git remote set-head origin -a)" >&2
   exit 1
 fi
 base_sha=$(git rev-parse "$base_ref")
@@ -138,10 +143,10 @@ if ! SKIP_PREPUSH_CHECKS=1 git push --force-with-lease="refs/heads/$slug:$claim_
   exit 1
 fi
 
-# Zero-touch hooks. If this repo vendors the canonical set from a source (laforge for
-# AG repos, scotty for personal) but hasn't yet (no integrity manifest present), bootstrap
+# Zero-touch hooks. If this repo vendors the canonical set from its source repo but
+# hasn't yet (no integrity manifest present), bootstrap
 # it; then activate (set core.hooksPath). Idempotent — a repo that already committed its
-# vendored scripts/githooks/ just re-activates. Source repos (laforge/scotty) ship the
+# vendored scripts/githooks/ just re-activates. The source repo ships the
 # manifest themselves, so they skip the vendor step and only activate.
 if [ -f "$ROOT/scripts/vendor-githooks.sh" ] && [ ! -f "$ROOT/scripts/githooks/CANONICAL.sha256" ]; then
   bash "$ROOT/scripts/vendor-githooks.sh" >/dev/null 2>&1 || true
@@ -169,7 +174,7 @@ if [ -d "$PCD" ] && [ ! -e "$FRAG" ]; then
 # Distribution rides the worktree tooling: new-session.sh / session-worktree.sh drop this
 # into the primary checkout's pre-commit.d/ when they create a worktree (local, untracked,
 # .git/info/exclude'd) — present exactly where/when you isolate, absent otherwise. NOT part
-# of the vendored canonical base. Source of record: scotty (personal) / laforge (AG)
+# of the vendored canonical base. Source of record: scotty
 # new-session.sh. Companion to hooks/sessionstart-worktree-reaper.py (clears the DEAD ones).
 #
 # WHY THIS EXISTS ALONGSIDE 20-shared-checkout:
