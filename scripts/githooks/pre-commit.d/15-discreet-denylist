@@ -2,20 +2,28 @@
 """15-discreet-denylist — HARD-BLOCK commits that stage discreet / personal identifiers.
 
 Independent of gitleaks (10-secret-scan): gitleaks catches credential VALUES; this
-catches identifier LEAKS that are not secrets but must never reach an AG-distributed or
-mirror-synced artifact — the owner's private compartment names, personal launchd label,
+catches identifier LEAKS that are not secrets but must never reach an externally-distributed
+or mirror-synced artifact — the owner's private compartment names, personal launchd label,
 home path, RFC1918 topology, localhost:port gateway refs, and known gateway hosts.
 
-Scans STAGED blob content (git show :file) for every added/modified text file. Any hit
+Scans the lines THIS COMMIT ADDS, in every added/modified text file. Content is read from
+the staged blob (git show :file) so line numbers match what is being committed, but only
+post-image lines named by `git diff --cached -U0` hunk headers are judged (see
+added_lines(); when that cannot be determined the whole blob is scanned — fail closed).
+An added file is entirely added lines, so new files are still scanned end to end. Any hit
 aborts the commit (exit 1). Prints file + line + which class fired — never the matched
 value — so this hook itself never echoes the sensitive string.
+
+This gate answers "do not ADD a discreet identifier". "Is the shipped ARTIFACT clean?" is
+a different question, answered at build time by the bundle scanner over the whole payload —
+refusing today's commit cannot un-publish a line that shipped last month anyway.
 
 Skips: binary blobs and any line carrying a `denylist:ignore` pragma. NOTHING ELSE is
 exempt — not even this dir (see SKIP_PREFIXES). Adjacent/`+`-joined string literals are
 folded and re-scanned, so splitting a value to evade the scan does not work.
 Loud, explicit bypass for genuine exceptions:
     OBRIEN_ALLOW_DENYLIST=1 git commit ...
-Root cause it guards: obrien.plugin shipped compartment names to the AG team (2026-07-15).
+Root cause it guards: obrien.plugin shipped compartment names to an outside team (2026-07-15).
 """
 import os
 import re
@@ -68,14 +76,34 @@ def _alternation(key, word_bounded=True):
 # (class label, compiled pattern). Structural patterns only — every value-bearing
 # class is loaded from config above. Nothing here names a compartment, a personal
 # login, a home path, or any other value this guard exists to catch.
+# ALWAYS-ON structural classes. These describe the OWNER'S actual environment, so they
+# are a leak wherever they land:
+#   rfc1918-ip   — a private address describes this person's real network
+#   gateway-host — names a specific external service this fleet talks to
 CHECKS = [
     ("rfc1918-ip", re.compile(
         r"\b(?:192\.168\.\d{1,3}\.\d{1,3}"
         r"|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
         r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")),
+]
+
+# DISTRIBUTING-ONLY structural classes — same tier as the owner/personal identifier
+# classes below, and for the same reason.
+#
+# The loopback address is IDENTICAL on every machine on earth. It describes nothing
+# about this owner, this network, or this person; a local MCP server binding loopback
+# is simply how a local MCP server works. A port number is mildly interesting only in
+# something that ships.
+#
+# Armed everywhere, these two produced pure false positives and taught people to reach
+# for the bypass: they already forced one repo's maintainer to bypass the hook to edit
+# seven files, and they blocked a scrub commit in a repo whose whole function is a
+# loopback-bound daemon, firing on its HOST constant. A guard that fires on that is not
+# protecting anything — it is training its own operator to ignore it, which is the
+# failure that matters, because the RFC1918 rule above is real.
+_STRUCTURAL_WHEN_DISTRIBUTING = [
     ("loopback-bind", re.compile(r"\b127\.0\.0\.1(?::\d+)?\b")),
     ("localhost-port", re.compile(r"\blocalhost:\d{2,5}\b")),
-    ("gateway-host", re.compile(r"starfleet-ambassador-group\.vercel\.app")),
 ]
 
 def _this_repo_name():
@@ -128,23 +156,151 @@ _REPO = _this_repo_name()
 # quiet failure there should be under-blocking a private repo, not stopping every
 # commit in it.
 _DISTRIBUTING = {v.lower() for v in _cfg_values("distributing_repos")}
-_ARMED = (("compartment-name", "compartment_tokens", True),) + (
+_ARMED = (("compartment-name", "compartment_tokens", True),
+          ("gateway-host", "gateway_hosts", True)) + (
     (("personal-identifier", "personal_tokens", False),
      ("owner-name", "owner_name_tokens", True))
     if _REPO.lower() in _DISTRIBUTING else ()
 )
 
+# Same tier for the two structural classes that only matter in something that ships.
+if _REPO.lower() in _DISTRIBUTING:
+    CHECKS.extend(_STRUCTURAL_WHEN_DISTRIBUTING)
+
 # A repo never denies its own subject: it would flag its own business data on every
 # commit. Same rule as install_preflight_conf.py, and for the same reason.
-_OWN = [t for t in _cfg_values("compartment_tokens") if t.lower() in _REPO.lower()]
+#
+# TWO SOURCES, and the second one is why this comment exists. Inferring the subject
+# from the directory name covers the easy case (a compartment's own repo) and MISSES
+# every repo that legitimately owns a compartment's work under a different name — a
+# ship plugin, a tooling repo, an archive. That case must be recorded explicitly, per
+# repo, under `own_subject_extra` in the guard config, so the exemption is auditable
+# and narrow rather than a blanket bypass.
+#
+# Shipped 2026-08-01 with only the name-based half wired up, which blocked a commit in
+# exactly the repo the owner had already sanctioned. The lesson is the general one: two
+# consumers of the same config (this hook and install_preflight_conf.py) drift the
+# moment one of them learns something the other does not.
+# GRANULARITY: an exemption must name the PATHS it applies to, not just the repo.
+#
+# The first version granted per repo, which is too coarse in the common case. A repo
+# holds two kinds of file: source that legitimately names a compartment and never ships
+# (an account registry, token helpers), and files that DO ship (skills/**/SKILL.md, a
+# generated plugin.json). A repo-wide grant covers both, so it silently disarms the check
+# on exactly the files that matter — and the bigger the legitimate use, the wider the
+# hole. Measured on the second repo to need one: 3 tokens, 20/45/68 occurrences across
+# 4/10/17 tracked files, impossible to narrow at TOKEN granularity because that repo is
+# the account registry for the whole stack. Token granularity was the wrong axis; path
+# granularity is the right one, and `SKIP_PREFIXES` already encodes the same idea in
+# hook code.
+#
+# TWO CONFIG SHAPES, and the second one exists because the first is a footgun ACROSS
+# VERSIONS. A sibling session verified this against the deployed hook rather than
+# theorising it:
+#
+#   "own_subject_extra": {"repo": {"tokens": [...], "paths": [...]}}
+#
+# is parsed by every PRE-scoping copy as `[t for t in extra if isinstance(t, str)]` —
+# and iterating a dict yields its KEYS. So an old copy exempts the literal strings
+# "tokens" and "paths", matches no real token, and the exemption silently evaporates.
+# It fails CLOSED (the commit blocks) rather than leaking, which is the safe direction,
+# but it blocks with no clue why — and the fleet always contains copies older than
+# canonical, so "just update the hook first" is a migration order somebody will get
+# wrong exactly once.
+#
+# THE FIX IS SHAPE, NOT SEQUENCING. Paths live under a separate top-level key:
+#
+#     "own_subject_extra": { "repo-b": ["tok"] },          <- unchanged; old code fine
+#     "own_subject_paths": { "repo-b": ["src/", "scripts/"] }
+#
+# An old copy never sees `own_subject_paths`, reads the list exactly as it always did,
+# and keeps its previous repo-wide behaviour — safe, and identical to today. A new copy
+# reads both and narrows the exemption to those paths. **Config written the new way is
+# therefore safe to deploy BEFORE the hook is vendored**, which removes the ordering
+# constraint rather than documenting it.
+#
+# The inline dict form is still accepted for anything already written that way, but the
+# two-key form is what to use.
+def _own_subject_spec():
+    """(repo_wide_tokens, [(path_prefix_tuple, token_set), ...]) for this repo."""
+    wide = [t for t in _cfg_values("compartment_tokens") if t.lower() in _REPO.lower()]
+    scoped = []
+    try:
+        import json
+        with open(GUARD_CFG) as fh:
+            entry = (json.load(fh).get("own_subject_extra") or {}).get(_REPO)
+    except Exception:
+        entry = None
+    if isinstance(entry, list):
+        wide += [t for t in entry if isinstance(t, str) and t.strip()]
+    elif isinstance(entry, dict):
+        # Accepted, but see the hazard note above — prefer the two-key form.
+        toks = [t for t in (entry.get("tokens") or []) if isinstance(t, str) and t.strip()]
+        paths = [q for q in (entry.get("paths") or []) if isinstance(q, str) and q.strip()]
+        if toks and paths:
+            scoped.append((tuple(paths), set(toks)))
+        elif toks:
+            wide += toks
+
+    # THE SAFE FORM: paths live under their OWN key, so old code never sees a shape it
+    # cannot parse. `own_subject_extra` keeps holding a plain list — exactly what every
+    # deployed copy already expects — and the scoping is additive.
+    try:
+        import json
+        with open(GUARD_CFG) as fh:
+            pth = (json.load(fh).get("own_subject_paths") or {}).get(_REPO) or []
+    except Exception:
+        pth = []
+    pth = [q for q in pth if isinstance(q, str) and q.strip()]
+    if pth and wide:
+        # Tokens named repo-wide become PATH-SCOPED once paths are declared for the repo.
+        scoped.append((tuple(pth), set(wide)))
+        wide = [t for t in wide if t.lower() in _REPO.lower()]   # keep the name-derived half
+    return wide, scoped
+
+
+_OWN, _SCOPED = _own_subject_spec()
+
+def _compile_alt(vals, word_bounded):
+    body = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in vals)
+    return re.compile((r"\b(?:%s)\b" if word_bounded else r"(?:%s)") % body, re.IGNORECASE)
+
+
+# Keep each value-bearing class's raw values so a per-path variant can be rebuilt. A
+# path-scoped exemption cannot be applied by deleting the token up front — that is
+# exactly the repo-wide behaviour it replaces.
+_CLASS_VALUES = {}
 
 for _label, _key, _wb in _ARMED:
     _vals = [v for v in _cfg_values(_key) if v not in _OWN]
     if not _vals:
         continue
-    _body = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in _vals)
-    _pat = re.compile((r"\b(?:%s)\b" if _wb else r"(?:%s)") % _body, re.IGNORECASE)
-    CHECKS.insert(0, (_label, _pat))
+    _CLASS_VALUES[_label] = (_vals, _wb)
+    CHECKS.insert(0, (_label, _compile_alt(_vals, _wb)))
+
+
+def _checks_for(path):
+    """CHECKS with any token exempted for THIS path dropped from its class.
+
+    Returns the shared CHECKS list unchanged when nothing is exempt here, so the common
+    case costs one set lookup and recompiles nothing.
+    """
+    exempt = set()
+    for prefixes, toks in _SCOPED:
+        if any(path.startswith(p) for p in prefixes):
+            exempt |= toks
+    if not exempt:
+        return CHECKS
+    out = []
+    for label, pat in CHECKS:
+        if label not in _CLASS_VALUES:
+            out.append((label, pat))          # structural class — never exemptable
+            continue
+        vals, wb = _CLASS_VALUES[label]
+        keep = [v for v in vals if v not in exempt]
+        if keep:
+            out.append((label, _compile_alt(keep, wb)))
+    return out
 
 # WHAT MAY BE EXEMPTED — and the one thing that never may.
 #
@@ -225,6 +381,56 @@ def staged_blob(path):
     return raw.decode("utf-8", errors="replace")
 
 
+_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def added_lines(path):
+    """Post-image line numbers this commit ADDS or MODIFIES in `path`.
+
+    Returns None when the answer is not knowable, and None means SCAN EVERYTHING.
+    Fail-closed is the whole design here: an unparseable hunk header must never be
+    read as "this commit added nothing", because that silently disarms the guard —
+    the invisible-gate failure this repo has already been bitten by twice (the
+    `OBRIEN_ALLOW_DENYLIST=0` bypass, and a denylist layer that never executed on any
+    repo for weeks while printing PASS).
+
+    WHY DIFF-SCOPE AT ALL. Judging the whole staged blob means judging lines the
+    commit did not write, and the only escape from a false hit is
+    OBRIEN_ALLOW_DENYLIST=1 — which disarms ALL classes for the whole commit,
+    compartment-name included. So one stale hit on an untouched line does not merely
+    annoy; it converts the guard into a total bypass, and it teaches the operator to
+    reach for that bypass by reflex. Measured 2026-08-01: 14 armed repos carry a
+    `localhost:<port>` in tracked files (mostly Ollama's published default 11434),
+    none of them added by the commits they were blocking.
+
+    Content already committed and pushed cannot be un-published by refusing the next
+    commit; "is the shipped artifact clean?" is answered at build time by the bundle
+    scanner, which reads the whole payload. This hook's job is "do not ADD it".
+
+    An ADDED file is entirely added lines, so new files still get scanned end to end.
+    """
+    r = subprocess.run(
+        ["git", "diff", "--cached", "-U0", "--no-color", "--", path],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return None
+    nums, saw_hunk = set(), False
+    for line in r.stdout.splitlines():
+        if not line.startswith("@@"):
+            continue
+        m = _HUNK.match(line)
+        if not m:
+            return None                # unrecognised header — do not guess
+        saw_hunk = True
+        start = int(m.group(1))
+        count = 1 if m.group(2) is None else int(m.group(2))
+        nums.update(range(start, start + count))
+    if not saw_hunk:
+        return None                    # no hunks parsed (rename/mode-only) — scan all
+    return nums
+
+
 def main():
     # Require an explicit affirmative value. A bare truthiness test accepted ANY
     # non-empty string — so `OBRIEN_ALLOW_DENYLIST=0`, which reads as "do not allow",
@@ -248,11 +454,14 @@ def main():
         text = staged_blob(path)
         if text is None:
             continue
+        scope = added_lines(path)      # None => judge every line (fail closed)
         for lineno, line in enumerate(text.splitlines(), 1):
+            if scope is not None and lineno not in scope:
+                continue
             if PRAGMA in line:
                 continue
             folded = collapse_concats(line)
-            for label, pat in CHECKS:
+            for label, pat in _checks_for(path):
                 if pat.search(line):
                     violations.append((path, lineno, label))
                 elif folded != line and pat.search(folded):
@@ -270,5 +479,115 @@ def main():
     return 0
 
 
+# ── SWEEP MODE ──────────────────────────────────────────────────────────────────────
+# "Which repos would adding this token make uncommittable?" Today you find that out one
+# blocked commit at a time — which is how two repos' exemptions were discovered.
+#
+# WHY THIS LIVES IN THE HOOK AND NOT IN A SEPARATE SCRIPT. A sibling built exactly this
+# externally, twice, and got it wrong the first time: it reported 6 repos would block when
+# the true answer was 1. The reimplementation missed name-based own-subject inference,
+# own_subject_extra, SKIP_PREFIXES, and the binary skip — four behaviours that all live
+# here. Any external caller re-derives this matching logic and drifts from it, and a sweep
+# that is confidently wrong is worse than no sweep, because its whole purpose is to be
+# believed before someone changes config.
+#
+# HOW IT STAYS HONEST: --sweep re-executes THIS FILE once per repo with that repo as cwd.
+# Every per-repo decision — _REPO, _ARMED, _OWN, _SCOPED, the compiled CHECKS — is
+# computed at import against the current working tree, so a subprocess per repo gets them
+# right by construction rather than by reimplementation. The only substitutions are the
+# two that make it a survey instead of a commit gate:
+#     staged_files() -> tracked files      (git ls-files, not the index diff)
+#     added_lines()  -> None               (judge the whole blob, as fail-closed already does)
+#
+# Output is `repo<TAB>path<TAB>label`, so it pipes into the fleet audit and into cut/sort.
+# Exit is ALWAYS 0: this reports, it never blocks.
+def tracked_files():
+    out = subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True).stdout
+    # `git ls-files` names a DIRECTORY when a submodule gitlink is present, which crashes
+    # a naive open(). Filter to real files rather than trusting the listing.
+    return [q for q in out.split("\0") if q and os.path.isfile(q)]
+
+
+def tracked_blob(path):
+    """Working-tree content, or None for binary/unreadable.
+
+    Deliberately the working tree, not HEAD: the question this answers is "what would
+    block if I committed what is here", and that is disk content.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except Exception:
+        return None
+    if b"\x00" in raw[:8192]:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def sweep_one():
+    """Survey THIS repo (cwd). Prints repo\tpath\tlabel. Always returns 0."""
+    repo = _REPO or os.path.basename(os.getcwd())
+    for path in tracked_files():
+        if any(path.startswith(pref) for pref in SKIP_PREFIXES):
+            continue
+        text = tracked_blob(path)
+        if text is None:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if PRAGMA in line:
+                continue
+            folded = collapse_concats(line)
+            for label, pat in _checks_for(path):
+                if pat.search(line) or (folded != line and pat.search(folded)):
+                    print(f"{repo}\t{path}:{lineno}\t{label}")
+                    break
+    return 0
+
+
+def sweep(repos):
+    """Re-exec this file once per repo, with that repo as cwd. See the note above."""
+    dev = os.environ.get("DEV_ROOT", os.path.expanduser("~/Developer"))
+    if not repos:
+        repos = sorted(
+            os.path.join(dev, d) for d in os.listdir(dev)
+            if os.path.isdir(os.path.join(dev, d, ".git")) and "-wt-" not in d
+            and not d.startswith("_archive")
+        )
+    # SAY WHAT THIS IS, on the output, every run.
+    #
+    # The sweep judges the WHOLE BLOB; a real commit judges only the lines it ADDS
+    # (added_lines(), scotty#74). So a row here means "this file CONTAINS a value", not
+    # "your next commit will block" — editing an unrelated line in one of these files is
+    # fine. Over-reporting is the correct direction for a planning tool, but only if it
+    # is labelled, or someone reads a 27-row repo as 27 broken commits.
+    print("# denylist --sweep: repo\tpath:line\tclass", file=sys.stderr)
+    print("# WHOLE-BLOB survey. A row = this file CONTAINS a matching value. A real commit"
+          " judges only ADDED lines, so this is an upper bound, not a prediction.",
+          file=sys.stderr)
+    rc = 0
+    for r in repos:
+        r = os.path.abspath(os.path.expanduser(r))
+        if not os.path.isdir(os.path.join(r, ".git")):
+            print(f"sweep: not a git repo, skipped: {r}", file=sys.stderr)
+            continue
+        res = subprocess.run([sys.executable, os.path.abspath(__file__), "--sweep-one"],
+                             cwd=r, capture_output=True, text=True)
+        sys.stdout.write(res.stdout)
+        if res.returncode != 0:
+            # Never silent: a repo that failed to survey is not a repo with no hits.
+            print(f"sweep: FAILED to survey {os.path.basename(r)} "
+                  f"(rc={res.returncode}): {res.stderr.strip()[:200]}", file=sys.stderr)
+            rc = 2
+    return rc
+
+
 if __name__ == "__main__":
+    if "--sweep-one" in sys.argv:
+        sys.exit(sweep_one())
+    if "--sweep" in sys.argv:
+        i = sys.argv.index("--sweep")
+        sys.exit(sweep([a for a in sys.argv[i + 1:] if not a.startswith("-")]))
     sys.exit(main())

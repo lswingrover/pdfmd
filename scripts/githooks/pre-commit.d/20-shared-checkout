@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # 20-shared-checkout — block committing into a git checkout that a LIVE sibling
 # Claude/Cowork session also occupies (the "two sessions commit each other's work"
-# failure). AG UNIVERSAL BASE check (byte-identical across repos; see CANONICAL.sha256).
+# failure). UNIVERSAL BASE check (byte-identical across repos; see CANONICAL.sha256).
 #
 # Origin: prototyped in the obrien repo (#39) as a monolithic pre-commit; contributed
-# up into the AG canonical dispatcher here as a fragment so it composes with the other
+# up into the canonical dispatcher here as a fragment so it composes with the other
 # base checks and rides the same core.hooksPath install. Canonical source now:
 # the scotty repo's scripts/githooks/. the personal dev-policy, Session isolation.
 #

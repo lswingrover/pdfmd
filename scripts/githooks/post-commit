@@ -1,3 +1,40 @@
+
+# ── PUSH FAILURE MUST LEAVE A TRACE ──────────────────────────────────────────────────
+# This hook used to push with `( git push … >/dev/null 2>&1 & ) >/dev/null 2>&1` —
+# detached, both streams discarded, exit code unexaminable — and this header used to call
+# a failed push "silent and harmless". It is neither.
+#
+# 2026-08-01: ELEVEN consecutive pushes failed across the fleet and produced not one byte
+# of signal. Every one of eleven repos held a commit that existed on no remote ref at all.
+# Stranded work is indistinguishable from pushed work, so nobody looked for a month's
+# worth of it until an audit asked git directly.
+#
+# The push stays BACKGROUNDED and NON-BLOCKING — that part was a correct decision, a hook
+# must not make you wait on the network. What changes is that failure now leaves a durable
+# trace instead of evaporating: a per-repo marker plus an appended log line. Success is
+# still completely silent, and the marker is removed on a later success so it can never go
+# stale and cry wolf.
+#
+# Read them with:  cat ~/.claude/push-failures/*.log
+# The fleet audit (scotty scripts/audit-vendored-githooks.sh) independently detects the
+# EFFECT — a commit on no remote. These markers record the CAUSE.
+_pushfail_dir="$HOME/.claude/push-failures"
+
+_push_and_record() {   # $1 = refspec/branch args, $2 = human label
+  (
+    if err=$(git push $1 2>&1); then
+      rm -f "$_pushfail_dir/$_slug" 2>/dev/null
+    else
+      mkdir -p "$_pushfail_dir" 2>/dev/null
+      printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$2" \
+        "$(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)" >> "$_pushfail_dir/$_slug"
+      printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$2" \
+        >> "$_pushfail_dir/all.log"
+    fi
+  ) >/dev/null 2>&1 &
+}
+
+_slug="$(printf '%s' "$PWD" | tr '/' '_' | sed 's/^_//').log"
 #!/usr/bin/env bash
 # post-commit: auto-publish the current branch to origin ("remote control").
 #
@@ -34,11 +71,11 @@ case "$branch" in
     # mirror of local state, not a branch anyone builds on.
     #
     # Recover with:  git fetch origin refs/backup/<branch>:refs/heads/rescue-<branch>
-    ( git push -f origin "HEAD:refs/backup/$branch" >/dev/null 2>&1 & ) >/dev/null 2>&1
+    _push_and_record "-f origin HEAD:refs/backup/$branch" "trunk-backup:$branch"
     exit 0 ;;
 esac
 
 # Background push; detach fully so the commit returns immediately and the hook
 # never reports a failure.
-( git push -u origin "$branch" >/dev/null 2>&1 & ) >/dev/null 2>&1
+_push_and_record "-u origin $branch" "feature-branch:$branch"
 exit 0
