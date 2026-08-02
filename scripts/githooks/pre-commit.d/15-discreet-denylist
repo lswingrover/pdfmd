@@ -2,8 +2,8 @@
 """15-discreet-denylist — HARD-BLOCK commits that stage discreet / personal identifiers.
 
 Independent of gitleaks (10-secret-scan): gitleaks catches credential VALUES; this
-catches identifier LEAKS that are not secrets but must never reach an AG-distributed or
-mirror-synced artifact — the owner's private compartment names, personal launchd label,
+catches identifier LEAKS that are not secrets but must never reach an externally-distributed
+or mirror-synced artifact — the owner's private compartment names, personal launchd label,
 home path, RFC1918 topology, localhost:port gateway refs, and known gateway hosts.
 
 Scans STAGED blob content (git show :file) for every added/modified text file. Any hit
@@ -15,7 +15,7 @@ exempt — not even this dir (see SKIP_PREFIXES). Adjacent/`+`-joined string lit
 folded and re-scanned, so splitting a value to evade the scan does not work.
 Loud, explicit bypass for genuine exceptions:
     OBRIEN_ALLOW_DENYLIST=1 git commit ...
-Root cause it guards: obrien.plugin shipped compartment names to the AG team (2026-07-15).
+Root cause it guards: obrien.plugin shipped compartment names to an outside team (2026-07-15).
 """
 import os
 import re
@@ -75,7 +75,6 @@ CHECKS = [
         r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")),
     ("loopback-bind", re.compile(r"\b127\.0\.0\.1(?::\d+)?\b")),
     ("localhost-port", re.compile(r"\blocalhost:\d{2,5}\b")),
-    ("gateway-host", re.compile(r"starfleet-ambassador-group\.vercel\.app")),
 ]
 
 def _this_repo_name():
@@ -128,7 +127,8 @@ _REPO = _this_repo_name()
 # quiet failure there should be under-blocking a private repo, not stopping every
 # commit in it.
 _DISTRIBUTING = {v.lower() for v in _cfg_values("distributing_repos")}
-_ARMED = (("compartment-name", "compartment_tokens", True),) + (
+_ARMED = (("compartment-name", "compartment_tokens", True),
+          ("gateway-host", "gateway_hosts", True)) + (
     (("personal-identifier", "personal_tokens", False),
      ("owner-name", "owner_name_tokens", True))
     if _REPO.lower() in _DISTRIBUTING else ()

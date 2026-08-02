@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# AG canonical pre-commit dispatcher — runs every executable in ./pre-commit.d/.
+# Canonical pre-commit dispatcher — runs every executable in ./pre-commit.d/.
 # "Universal base + pluggable per-repo checks": add a repo check as a pre-commit.d/
 # fragment without editing this file. Any fragment exiting non-zero aborts the commit.
 #
-# Canonical source: the scotty repo's scripts/githooks/. the personal dev-policy, Session isolation.
+# Canonical source: this repo's scripts/githooks/ (see the dev policy, Session isolation).
 # Activate once per clone: bash scripts/install-git-hooks.sh
 set -eu
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
