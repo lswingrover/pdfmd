@@ -6,9 +6,17 @@ catches identifier LEAKS that are not secrets but must never reach an externally
 or mirror-synced artifact — the owner's private compartment names, personal launchd label,
 home path, RFC1918 topology, localhost:port gateway refs, and known gateway hosts.
 
-Scans STAGED blob content (git show :file) for every added/modified text file. Any hit
+Scans the lines THIS COMMIT ADDS, in every added/modified text file. Content is read from
+the staged blob (git show :file) so line numbers match what is being committed, but only
+post-image lines named by `git diff --cached -U0` hunk headers are judged (see
+added_lines(); when that cannot be determined the whole blob is scanned — fail closed).
+An added file is entirely added lines, so new files are still scanned end to end. Any hit
 aborts the commit (exit 1). Prints file + line + which class fired — never the matched
 value — so this hook itself never echoes the sensitive string.
+
+This gate answers "do not ADD a discreet identifier". "Is the shipped ARTIFACT clean?" is
+a different question, answered at build time by the bundle scanner over the whole payload —
+refusing today's commit cannot un-publish a line that shipped last month anyway.
 
 Skips: binary blobs and any line carrying a `denylist:ignore` pragma. NOTHING ELSE is
 exempt — not even this dir (see SKIP_PREFIXES). Adjacent/`+`-joined string literals are
@@ -68,11 +76,32 @@ def _alternation(key, word_bounded=True):
 # (class label, compiled pattern). Structural patterns only — every value-bearing
 # class is loaded from config above. Nothing here names a compartment, a personal
 # login, a home path, or any other value this guard exists to catch.
+# ALWAYS-ON structural classes. These describe the OWNER'S actual environment, so they
+# are a leak wherever they land:
+#   rfc1918-ip   — a private address describes this person's real network
+#   gateway-host — names a specific external service this fleet talks to
 CHECKS = [
     ("rfc1918-ip", re.compile(
         r"\b(?:192\.168\.\d{1,3}\.\d{1,3}"
         r"|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
         r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")),
+]
+
+# DISTRIBUTING-ONLY structural classes — same tier as the owner/personal identifier
+# classes below, and for the same reason.
+#
+# The loopback address is IDENTICAL on every machine on earth. It describes nothing
+# about this owner, this network, or this person; a local MCP server binding loopback
+# is simply how a local MCP server works. A port number is mildly interesting only in
+# something that ships.
+#
+# Armed everywhere, these two produced pure false positives and taught people to reach
+# for the bypass: they already forced one repo's maintainer to bypass the hook to edit
+# seven files, and they blocked a scrub commit in a repo whose whole function is a
+# loopback-bound daemon, firing on its HOST constant. A guard that fires on that is not
+# protecting anything — it is training its own operator to ignore it, which is the
+# failure that matters, because the RFC1918 rule above is real.
+_STRUCTURAL_WHEN_DISTRIBUTING = [
     ("loopback-bind", re.compile(r"\b127\.0\.0\.1(?::\d+)?\b")),
     ("localhost-port", re.compile(r"\blocalhost:\d{2,5}\b")),
 ]
@@ -133,6 +162,10 @@ _ARMED = (("compartment-name", "compartment_tokens", True),
      ("owner-name", "owner_name_tokens", True))
     if _REPO.lower() in _DISTRIBUTING else ()
 )
+
+# Same tier for the two structural classes that only matter in something that ships.
+if _REPO.lower() in _DISTRIBUTING:
+    CHECKS.extend(_STRUCTURAL_WHEN_DISTRIBUTING)
 
 # A repo never denies its own subject: it would flag its own business data on every
 # commit. Same rule as install_preflight_conf.py, and for the same reason.
@@ -312,6 +345,56 @@ def staged_blob(path):
     return raw.decode("utf-8", errors="replace")
 
 
+_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def added_lines(path):
+    """Post-image line numbers this commit ADDS or MODIFIES in `path`.
+
+    Returns None when the answer is not knowable, and None means SCAN EVERYTHING.
+    Fail-closed is the whole design here: an unparseable hunk header must never be
+    read as "this commit added nothing", because that silently disarms the guard —
+    the invisible-gate failure this repo has already been bitten by twice (the
+    `OBRIEN_ALLOW_DENYLIST=0` bypass, and a denylist layer that never executed on any
+    repo for weeks while printing PASS).
+
+    WHY DIFF-SCOPE AT ALL. Judging the whole staged blob means judging lines the
+    commit did not write, and the only escape from a false hit is
+    OBRIEN_ALLOW_DENYLIST=1 — which disarms ALL classes for the whole commit,
+    compartment-name included. So one stale hit on an untouched line does not merely
+    annoy; it converts the guard into a total bypass, and it teaches the operator to
+    reach for that bypass by reflex. Measured 2026-08-01: 14 armed repos carry a
+    `localhost:<port>` in tracked files (mostly Ollama's published default 11434),
+    none of them added by the commits they were blocking.
+
+    Content already committed and pushed cannot be un-published by refusing the next
+    commit; "is the shipped artifact clean?" is answered at build time by the bundle
+    scanner, which reads the whole payload. This hook's job is "do not ADD it".
+
+    An ADDED file is entirely added lines, so new files still get scanned end to end.
+    """
+    r = subprocess.run(
+        ["git", "diff", "--cached", "-U0", "--no-color", "--", path],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return None
+    nums, saw_hunk = set(), False
+    for line in r.stdout.splitlines():
+        if not line.startswith("@@"):
+            continue
+        m = _HUNK.match(line)
+        if not m:
+            return None                # unrecognised header — do not guess
+        saw_hunk = True
+        start = int(m.group(1))
+        count = 1 if m.group(2) is None else int(m.group(2))
+        nums.update(range(start, start + count))
+    if not saw_hunk:
+        return None                    # no hunks parsed (rename/mode-only) — scan all
+    return nums
+
+
 def main():
     # Require an explicit affirmative value. A bare truthiness test accepted ANY
     # non-empty string — so `OBRIEN_ALLOW_DENYLIST=0`, which reads as "do not allow",
@@ -335,7 +418,10 @@ def main():
         text = staged_blob(path)
         if text is None:
             continue
+        scope = added_lines(path)      # None => judge every line (fail closed)
         for lineno, line in enumerate(text.splitlines(), 1):
+            if scope is not None and lineno not in scope:
+                continue
             if PRAGMA in line:
                 continue
             folded = collapse_concats(line)
