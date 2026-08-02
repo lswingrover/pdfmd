@@ -148,27 +148,90 @@ _ARMED = (("compartment-name", "compartment_tokens", True),
 # exactly the repo the owner had already sanctioned. The lesson is the general one: two
 # consumers of the same config (this hook and install_preflight_conf.py) drift the
 # moment one of them learns something the other does not.
-def _own_subject_tokens():
-    tokens = [t for t in _cfg_values("compartment_tokens") if t.lower() in _REPO.lower()]
+# GRANULARITY: an exemption must name the PATHS it applies to, not just the repo.
+#
+# The first version granted per repo, which is too coarse in the common case. A repo
+# holds two kinds of file: source that legitimately names a compartment and never ships
+# (an account registry, token helpers), and files that DO ship (skills/**/SKILL.md, a
+# generated plugin.json). A repo-wide grant covers both, so it silently disarms the check
+# on exactly the files that matter — and the bigger the legitimate use, the wider the
+# hole. Measured on the second repo to need one: 3 tokens, 20/45/68 occurrences across
+# 4/10/17 tracked files, impossible to narrow at TOKEN granularity because that repo is
+# the account registry for the whole stack. Token granularity was the wrong axis; path
+# granularity is the right one, and `SKIP_PREFIXES` already encodes the same idea in
+# hook code.
+#
+# Config accepts both forms; the list form stays repo-wide so existing entries keep
+# working, and is the one to migrate away from:
+#     "own_subject_extra": {
+#       "repo-a": ["tok"],                                    # repo-wide (legacy)
+#       "repo-b": {"tokens": ["tok"], "paths": ["src/", "scripts/"]}
+#     }
+# A dict with no "paths" is also repo-wide — explicitly, rather than by omission.
+def _own_subject_spec():
+    """(repo_wide_tokens, [(path_prefix_tuple, token_set), ...]) for this repo."""
+    wide = [t for t in _cfg_values("compartment_tokens") if t.lower() in _REPO.lower()]
+    scoped = []
     try:
         import json
         with open(GUARD_CFG) as fh:
-            extra = (json.load(fh).get("own_subject_extra") or {}).get(_REPO) or []
-        tokens += [t for t in extra if isinstance(t, str) and t.strip()]
+            entry = (json.load(fh).get("own_subject_extra") or {}).get(_REPO)
     except Exception:
-        pass
-    return tokens
+        entry = None
+    if isinstance(entry, list):
+        wide += [t for t in entry if isinstance(t, str) and t.strip()]
+    elif isinstance(entry, dict):
+        toks = [t for t in (entry.get("tokens") or []) if isinstance(t, str) and t.strip()]
+        paths = [p for p in (entry.get("paths") or []) if isinstance(p, str) and p.strip()]
+        if toks and paths:
+            scoped.append((tuple(paths), set(toks)))
+        elif toks:
+            wide += toks
+    return wide, scoped
 
 
-_OWN = _own_subject_tokens()
+_OWN, _SCOPED = _own_subject_spec()
+
+def _compile_alt(vals, word_bounded):
+    body = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in vals)
+    return re.compile((r"\b(?:%s)\b" if word_bounded else r"(?:%s)") % body, re.IGNORECASE)
+
+
+# Keep each value-bearing class's raw values so a per-path variant can be rebuilt. A
+# path-scoped exemption cannot be applied by deleting the token up front — that is
+# exactly the repo-wide behaviour it replaces.
+_CLASS_VALUES = {}
 
 for _label, _key, _wb in _ARMED:
     _vals = [v for v in _cfg_values(_key) if v not in _OWN]
     if not _vals:
         continue
-    _body = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in _vals)
-    _pat = re.compile((r"\b(?:%s)\b" if _wb else r"(?:%s)") % _body, re.IGNORECASE)
-    CHECKS.insert(0, (_label, _pat))
+    _CLASS_VALUES[_label] = (_vals, _wb)
+    CHECKS.insert(0, (_label, _compile_alt(_vals, _wb)))
+
+
+def _checks_for(path):
+    """CHECKS with any token exempted for THIS path dropped from its class.
+
+    Returns the shared CHECKS list unchanged when nothing is exempt here, so the common
+    case costs one set lookup and recompiles nothing.
+    """
+    exempt = set()
+    for prefixes, toks in _SCOPED:
+        if any(path.startswith(p) for p in prefixes):
+            exempt |= toks
+    if not exempt:
+        return CHECKS
+    out = []
+    for label, pat in CHECKS:
+        if label not in _CLASS_VALUES:
+            out.append((label, pat))          # structural class — never exemptable
+            continue
+        vals, wb = _CLASS_VALUES[label]
+        keep = [v for v in vals if v not in exempt]
+        if keep:
+            out.append((label, _compile_alt(keep, wb)))
+    return out
 
 # WHAT MAY BE EXEMPTED — and the one thing that never may.
 #
@@ -276,7 +339,7 @@ def main():
             if PRAGMA in line:
                 continue
             folded = collapse_concats(line)
-            for label, pat in CHECKS:
+            for label, pat in _checks_for(path):
                 if pat.search(line):
                     violations.append((path, lineno, label))
                 elif folded != line and pat.search(folded):
