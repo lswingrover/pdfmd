@@ -1,0 +1,42 @@
+# Fleet CI — universal GUARD workflow. Vendored self-contained via vendor-ci.sh (source: scotty).
+# This is the publish-readiness guard EVERY live repo gets (ci-reform Phase 1). It carries the two
+# CI-enforceable layers of the three-layer model (plan §5):
+#   layer 1  publish-guard  — no secret-bearing FILE is tracked (structural; runs .github/ci/publish-guard.sh)
+#   layer 2  secret-scan    — gitleaks scans file CONTENT for credential VALUES (backstop for the
+#                             local 10-secret-scan hook, for when that hook was bypassed/absent)
+# layer 3 (identifier LEAKS, the 15-discreet-denylist hook) is LOCAL-ONLY by design — it stores no
+# values and fails open, so CI cannot enforce it and does not pretend to. "private now, public-ready always."
+name: guard
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+permissions:
+  contents: read                        # least privilege — the guard only reads the tree
+
+jobs:
+  publish-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/ci/publish-guard.sh
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.30.1"          # pinned; bump deliberately
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"  # linux_x64 tarball
+    steps:
+      - uses: actions/checkout@v4
+      - name: gitleaks (working tree, redacted)
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gl.tgz
+          echo "${GITLEAKS_SHA256}  /tmp/gl.tgz" | sha256sum -c -    # supply-chain: verify before exec
+          tar -xzf /tmp/gl.tgz -C /tmp gitleaks
+          # --no-git scans the working tree only (no history) -> deterministic, never red-on-arrival
+          # from ancient commits. --redact keeps any match out of the logs. A repo suppresses a
+          # VERIFIED false positive with a tracked .gitleaks.toml at its root.
+          /tmp/gitleaks detect --source . --no-git --redact -v
