@@ -1,0 +1,39 @@
+# Fleet CI — Python template. Vendored self-contained via vendor-ci.sh (source: scotty).
+# EDIT markers: (1) install line, (2) working-directory when the package lives in a subdirectory.
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    # defaults:                              # EDIT (2): uncomment when the package is in a subdir
+    #   run:
+    #     working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # EDIT (1): pick ONE install path:
+      - run: pip install -e '.[dev]'            # has pyproject/setup with a dev extra
+      # - run: pip install -r requirements.txt  # requirements-only repos
+      # Lint is ADVISORY until the tree is clean; then DELETE continue-on-error to gate (plan §8 Phase 5).
+      # ruff is installed here so the step reports real findings instead of failing on a missing
+      # tool — repos need not carry ruff in their own deps (many ship black/flake8 instead).
+      - name: ruff (advisory)
+        run: |
+          pip install -q ruff
+          ruff check .
+        continue-on-error: true
+      - run: pytest -q
+
+# NOTE: the publish-readiness guard is NOT here — every repo also gets the universal
+# guard.yml (publish-guard + gitleaks) via vendor-ci.sh. This workflow is test/build only.
