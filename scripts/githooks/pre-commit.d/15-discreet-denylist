@@ -14,6 +14,12 @@ An added file is entirely added lines, so new files are still scanned end to end
 aborts the commit (exit 1). Prints file + line + which class fired — never the matched
 value — so this hook itself never echoes the sensitive string.
 
+A repo-wide own-subject exemption (a plain-list `own_subject_extra` entry with no
+`own_subject_paths` narrowing) silently disarms the compartment class on that repo's
+shipping paths too — the hole that leaked a compartment name into CI templates, caught
+2026-08-19. Such exemptions are still honoured (they are a supported form), but
+every added line one is hiding is now surfaced as a NON-BLOCKING note, never left silent.
+
 This gate answers "do not ADD a discreet identifier". "Is the shipped ARTIFACT clean?" is
 a different question, answered at build time by the bundle scanner over the whole payload —
 refusing today's commit cannot un-publish a line that shipped last month anyway.
@@ -138,6 +144,29 @@ _STRUCTURAL_WHEN_DISTRIBUTING = [
     ("loopback-bind", re.compile(r"\b127\.0\.0\.1(?::\d+)?\b")),
     ("localhost-port", re.compile(r"\blocalhost:\d{2,5}\b")),
 ]
+def _git_text(args, cwd=None):
+    """Run git and decode its output LENIENTLY.
+
+    `text=True` makes subprocess decode as strict UTF-8 and raise UnicodeDecodeError deep
+    inside `_translate_newlines` if it cannot. Git does not promise UTF-8: a file git treats
+    as text (no NUL in the first 8k, so it appears in a diff with real content lines) can
+    still hold Latin-1 bytes, and so can a path.
+
+    Observed 2026-08-19: staging a file of `ISO-8859 text` made this hook die with a raw
+    traceback ending `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff`. It failed
+    CLOSED — the commit was blocked, so no guard-open hole — but the operator got a Python
+    stack instead of a verdict, which is indistinguishable from the guard being broken. That
+    is the failure mode this fleet keeps paying for: a detector that will not say what it
+    found cannot be told apart from one that is wrong.
+
+    `staged_blob()` below already had this right (bytes, then errors="replace"). The file was
+    inconsistent with itself, which is why the crash survived every earlier pass over it.
+    """
+    r = subprocess.run(args, capture_output=True, cwd=cwd)
+    return r.returncode, r.stdout.decode("utf-8", errors="replace")
+
+
+
 
 def _this_repo_name():
     """Canonical repo name for the tree being committed to, or '' if undeterminable.
@@ -150,18 +179,23 @@ def _this_repo_name():
     stripping the -wt- suffix.
     """
     try:
-        common = subprocess.run(["git", "rev-parse", "--path-format=absolute",
-                                 "--git-common-dir"], capture_output=True, text=True)
-        if common.returncode == 0 and common.stdout.strip():
+        rc, out = _git_text(["git", "rev-parse", "--path-format=absolute",
+                             "--git-common-dir"])
+        if rc == 0 and out.strip():
             # .../<repo>/.git  ->  <repo>
-            parent = os.path.dirname(common.stdout.strip().rstrip("/"))
+            parent = os.path.dirname(out.strip().rstrip("/"))
             if parent:
                 return os.path.basename(parent)
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True)
-        name = os.path.basename(r.stdout.strip()) if r.returncode == 0 else ""
+        rc, out = _git_text(["git", "rev-parse", "--show-toplevel"])
+        name = os.path.basename(out.strip()) if rc == 0 else ""
         return name.split("-wt-")[0]
-    except Exception:
+    except Exception as exc:
+        # DO NOT fail silently here. An empty repo name disarms every repo-keyed tier —
+        # own_subject_extra and distributing_repos both look this repo up by name — so a
+        # swallowed exception turns the owner/personal classes off with no trace. Say so.
+        print(f"pre-commit[discreet-denylist]: WARNING — could not determine the repo name "
+              f"({exc.__class__.__name__}); repo-keyed exemptions and the personal/owner "
+              f"tier will NOT arm for this commit.", file=sys.stderr)
         return ""
 
 
@@ -316,6 +350,35 @@ for _label, _key, _wb in _ARMED:
     CHECKS.insert(0, (_label, _compile_alt(_vals, _wb)))
 
 
+# VISIBILITY FOR REPO-WIDE OWN-SUBJECT EXEMPTIONS — the silent hole that leaked (2026-08-19).
+#
+# A repo-wide own-subject grant strips a compartment token from EVERY path in the repo,
+# `.github/` and `skills/` included, and does it SILENTLY. That is by design for a repo that
+# IS the subject (name-inferred: token is a substring of the repo name — naming itself is
+# expected). It is a FOOTGUN for a foreign repo that merely holds some legitimate references
+# and declares them via a plain-list `own_subject_extra` with no `own_subject_paths` narrowing:
+# the grant then disarms the guard on the repo's shipping paths too, and nothing says so.
+#
+# That is exactly what happened: a plain-list `own_subject_extra` grant for a distributing
+# repo (repo-wide) let a compartment name into its CI templates unblocked; the same token was
+# caught only at consume-time by a fresh repo's hook. The docstring had WARNED about the coarse
+# form for weeks and it still bit — documentation alone does not close an invisible-gate hole.
+#
+# The fix is not to BLOCK the coarse form (it is a supported, sometimes-correct choice, and a
+# repo like an account registry legitimately relies on it). The fix is to make each let-through
+# VISIBLE: a non-blocking NOTE naming path:line (never the value) for every added line a
+# repo-wide own_subject_extra grant is hiding. A name-inferred token needs no note — the repo
+# is the subject. `_SHADOW` therefore matches ONLY the extra-sourced repo-wide tokens.
+#
+# STRICTLY ADDITIVE: `_SHADOW` never feeds `violations` or the exit code — it can only print a
+# diagnostic. Worst case if it ever errored is a fail-closed block, never a weakened gate.
+_OWN_WIDE_EXTRA = [t for t in _OWN if t.lower() not in _REPO.lower()]
+try:
+    _SHADOW = _compile_alt(_OWN_WIDE_EXTRA, True) if _OWN_WIDE_EXTRA else None
+except Exception:
+    _SHADOW = None
+
+
 def _checks_for(path):
     """CHECKS with any token exempted for THIS path dropped from its class.
 
@@ -376,6 +439,26 @@ SKIP_PREFIXES = (
 _CONCAT = re.compile(r'(["\'])([^"\'\n]*)\1\s*\+?\s*[rbf]{0,2}(["\'])([^"\'\n]*)\3')
 
 
+def git_lines(text):
+    """Split exactly the way git NUMBERS lines: on "\n", and on nothing else.
+
+    `str.splitlines()` also splits on U+2028 LINE SEPARATOR, U+2029, U+0085 NEL, \x0b, \x0c
+    and \x1c-\x1e. git counts none of them. So a file holding any of those produced MORE
+    python lines than git lines, every subsequent line number shifted, and the added line the
+    guard was told to judge (`scope`, numbered by git) stopped lining up with the line it was
+    actually looking at.
+
+    That is a FAIL-OPEN, and it needs no attacker: U+2028 arrives routinely from PDF
+    extraction and JS minifiers and is invisible in most editors. Reproduced 2026-08-19 —
+    a staged line adding an RFC1918 address went through unblocked with a single U+2028
+    elsewhere in the file.
+
+    Fail-open is the one direction this guard must never fail in, so the two numbering schemes
+    have to be the same scheme, not merely similar.
+    """
+    return text.split("\n")
+
+
 def collapse_concats(line):
     """Fold adjacent / `+`-joined string literals into one, so a value hidden by
     splitting is scanned in its reconstructed form.
@@ -401,10 +484,17 @@ def collapse_concats(line):
 
 
 def staged_files():
-    out = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM", "-z"],
-        capture_output=True, text=True,
-    ).stdout
+    # FAIL CLOSED on a git error. Discarding the rc (the old `_, out`) meant a failed
+    # `git diff` returned an empty list -> zero files scanned -> the gate PASSED an
+    # unscanned commit. That is exactly this file's own stated failure mode: "a detector
+    # that will not say what it found cannot be told apart from one that is wrong." A
+    # security gate that cannot read the index must BLOCK, never wave the commit through.
+    rc, out = _git_text(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM", "-z"])
+    if rc != 0:
+        print("pre-commit[discreet-denylist]: BLOCKED — could not read the staged file list "
+              f"(git diff exit {rc}); refusing to pass an unscanned commit.", file=sys.stderr)
+        sys.exit(1)
     return [p for p in out.split("\0") if p]
 
 
@@ -446,14 +536,13 @@ def added_lines(path):
 
     An ADDED file is entirely added lines, so new files still get scanned end to end.
     """
-    r = subprocess.run(
-        ["git", "diff", "--cached", "-U0", "--no-color", "--", path],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
+    # THE crash site: this diff carries the file's own content lines, so a repo with one
+    # Latin-1 file killed the whole hook.
+    rc, out = _git_text(["git", "diff", "--cached", "-U0", "--no-color", "--", path])
+    if rc != 0:
         return None
     nums, saw_hunk = set(), False
-    for line in r.stdout.splitlines():
+    for line in out.splitlines():
         if not line.startswith("@@"):
             continue
         m = _HUNK.match(line)
@@ -485,6 +574,7 @@ def main():
               file=sys.stderr)
 
     violations = []
+    let_through = []               # added lines a repo-wide own_subject_extra grant is hiding
     for path in staged_files():
         if any(path.startswith(p) for p in SKIP_PREFIXES):
             continue
@@ -492,7 +582,8 @@ def main():
         if text is None:
             continue
         scope = added_lines(path)      # None => judge every line (fail closed)
-        for lineno, line in enumerate(text.splitlines(), 1):
+        # git_lines, NOT splitlines: `scope` is numbered by git, and the two must agree.
+        for lineno, line in enumerate(git_lines(text), 1):
             if scope is not None and lineno not in scope:
                 continue
             if PRAGMA in line:
@@ -503,6 +594,26 @@ def main():
                     violations.append((path, lineno, label))
                 elif folded != line and pat.search(folded):
                     violations.append((path, lineno, label + " (split literal)"))
+            # Additive diagnostic only — see the _SHADOW block above. Never blocks.
+            if _SHADOW is not None and (_SHADOW.search(line)
+                                        or (folded != line and _SHADOW.search(folded))):
+                let_through.append((path, lineno))
+
+    if let_through:
+        shown = let_through[:20]
+        print("\npre-commit[discreet-denylist]: NOTE — {} added line(s) contain a token "
+              "exempted REPO-WIDE for this repo via own_subject_extra (no own_subject_paths "
+              "narrowing). ALLOWED here, but a repo-wide own-subject grant also disarms this "
+              "guard on shipping paths (.github/, skills/, scripts/):".format(len(let_through)),
+              file=sys.stderr)
+        for path, lineno in shown:
+            print(f"  {path}:{lineno}", file=sys.stderr)
+        if len(let_through) > len(shown):
+            print(f"  … and {len(let_through) - len(shown)} more", file=sys.stderr)
+        print("Narrow it to the paths that legitimately reference the token: add an "
+              "own_subject_paths entry for this repo in\n"
+              "~/.config/claude-guards/compartments.json. Informational — the commit is NOT "
+              "blocked by this note.\n", file=sys.stderr)
 
     if violations:
         print("\npre-commit[discreet-denylist]: BLOCKED — staged content contains "
@@ -539,7 +650,7 @@ def main():
 # Output is `repo<TAB>path<TAB>label`, so it pipes into the fleet audit and into cut/sort.
 # Exit is ALWAYS 0: this reports, it never blocks.
 def tracked_files():
-    out = subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True).stdout
+    _, out = _git_text(["git", "ls-files", "-z"])
     # `git ls-files` names a DIRECTORY when a submodule gitlink is present, which crashes
     # a naive open(). Filter to real files rather than trusting the listing.
     return [q for q in out.split("\0") if q and os.path.isfile(q)]
@@ -558,10 +669,16 @@ def tracked_blob(path):
         return None
     if b"\x00" in raw[:8192]:
         return None
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
+    # errors="replace", matching staged_blob(). A strict decode here returned None on any
+    # non-UTF-8 file, which the caller reads as "nothing to see" — so `--sweep` walked past a
+    # Latin-1 file and reported nothing, silently. The sweep's whole job is to name what is
+    # there; under-reporting is the one thing it must not do, and it did it without a word.
+    #
+    # This is the third instance of one mistake in this file: staged_blob() was lenient,
+    # added_line_numbers() was strict (scotty#107, it crashed), and this was strict (scotty#111,
+    # it went quiet). Same question, three answers. A binary file is still skipped by the NUL
+    # check above, which is the test that actually distinguishes "not text" from "not UTF-8".
+    return raw.decode("utf-8", errors="replace")
 
 
 def _sweep_basis():
@@ -608,7 +725,9 @@ def sweep_one():
         text = tracked_blob(path)
         if text is None:
             continue
-        for lineno, line in enumerate(text.splitlines(), 1):
+        # Same numbering as the commit path, so a sweep and a commit cannot disagree about
+        # which line a hit is on.
+        for lineno, line in enumerate(git_lines(text), 1):
             if PRAGMA in line:
                 continue
             folded = collapse_concats(line)
