@@ -6,9 +6,9 @@ catches identifier LEAKS that are not secrets but must never reach an externally
 or mirror-synced artifact — the owner's private compartment names, personal launchd label,
 home path, RFC1918 topology, localhost:port gateway refs, and known gateway hosts.
 
-Scans the lines THIS COMMIT ADDS, in every added/modified text file. Content is read from
-the staged blob (git show :file) so line numbers match what is being committed, but only
-post-image lines named by `git diff --cached -U0` hunk headers are judged (see
+Scans the lines THIS COMMIT ADDS, in every added/modified/renamed/type-changed text file.
+Content is read from the staged blob by id so line numbers match what is being committed,
+but only post-image lines named by a blob-to-blob `git diff -U0` are judged (see
 added_lines(); when that cannot be determined the whole blob is scanned — fail closed).
 An added file is entirely added lines, so new files are still scanned end to end. Any hit
 aborts the commit (exit 1). Prints file + line + which class fired — never the matched
@@ -412,16 +412,22 @@ except Exception:
     _SHADOW = None
 
 
+def _exempt_for(path):
+    """Tokens a path-scoped own-subject grant exempts at THIS path (empty set if none)."""
+    exempt = set()
+    for prefixes, toks in _SCOPED:
+        if any(path.startswith(p) for p in prefixes):
+            exempt |= toks
+    return exempt
+
+
 def _checks_for(path):
     """CHECKS with any token exempted for THIS path dropped from its class.
 
     Returns the shared CHECKS list unchanged when nothing is exempt here, so the common
     case costs one set lookup and recompiles nothing.
     """
-    exempt = set()
-    for prefixes, toks in _SCOPED:
-        if any(path.startswith(p) for p in prefixes):
-            exempt |= toks
+    exempt = _exempt_for(path)
     if not exempt:
         return CHECKS
     out = []
@@ -467,6 +473,30 @@ SKIP_PREFIXES = (
     "README",             # repo-facing; the plugin ships its own docs/
     "CONTRIBUTING",       # repo-facing
 )
+
+# HOME-PATH STILL SCANS THREE OF THOSE (2026-09-28, scotty#150). The skips above answer
+# "what does obrien's plugin build package?", but home-path answers a fleet-wide question:
+# would this line need scrubbing if the repo went public? A README is the first file anyone
+# reads then, and build tooling that hardcodes a home folder breaks on every other machine.
+# `docs/internal/` stays fully skipped (it is the sanctioned home for real history), and so
+# does `tests/` (a path detector's own tests legitimately contain the pattern). Measured
+# across 58 repos when this landed: 0 home-path lines under these three prefixes, so it
+# blocked nothing on arrival. Every OTHER class keeps skipping them.
+_HOME_ALSO_SCANS = ("README", "CONTRIBUTING", "build/")
+
+
+def _checks_at(path):
+    """The checks that apply at `path`, or None when the path is skipped outright.
+
+    The ONE place both the commit gate and --sweep ask "what runs here?", so a sweep and a
+    commit cannot disagree about a skipped path.
+    """
+    if not any(path.startswith(p) for p in SKIP_PREFIXES):
+        return _checks_for(path)
+    if path.startswith(_HOME_ALSO_SCANS):
+        home = [c for c in CHECKS if c[0] == "home-path"]
+        return home or None
+    return None
 
 
 _CONCAT = re.compile(r'(["\'])([^"\'\n]*)\1\s*\+?\s*[rbf]{0,2}(["\'])([^"\'\n]*)\3')
@@ -516,25 +546,80 @@ def collapse_concats(line):
     return line
 
 
+def _blocked_unreadable(why):
+    print("pre-commit[discreet-denylist]: BLOCKED — could not read the staged file list "
+          f"({why}); refusing to pass an unscanned commit.", file=sys.stderr)
+    sys.exit(1)
+
+
+_RAW = re.compile(r"^:(\d{6}) (\d{6}) ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([ACMRT])(\d{0,3})$")
+
+
 def staged_files():
-    # FAIL CLOSED on a git error. Discarding the rc (the old `_, out`) meant a failed
-    # `git diff` returned an empty list -> zero files scanned -> the gate PASSED an
-    # unscanned commit. That is exactly this file's own stated failure mode: "a detector
-    # that will not say what it found cannot be told apart from one that is wrong." A
-    # security gate that cannot read the index must BLOCK, never wave the commit through.
-    rc, out = _git_text(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM", "-z"])
+    """[(path, renamed_from, old_blob, new_blob)] for every file this commit adds, modifies,
+    renames or changes the type of. `old_blob` is None when every line counts as new.
+
+    RENAMES WERE INVISIBLE until 2026-09-28 (scotty#148). The list came from
+    `--diff-filter=ACM`, and git reports a file moved AND edited in one commit as `R`, so its
+    added lines were never judged, for any class: `git mv a b`, append a violating line,
+    commit, clean. TYPE CHANGES (`T`, a symlink replaced by a file) were invisible the same
+    way. Adding `R` alone is not the fix: diffed on its own, the new path has no old side and
+    reads as a brand-new file, which re-judges every line anything that moves already carries
+    (the stale-hit false positive #74 removed). So a rename keeps its old blob.
+
+    WHY BLOB IDS, NOT PATHS OR SIMILARITY (found in review, both reproduced):
+      - git's "similarity index 100%" is an ESTIMATE over hashed chunks. Reordering 64-byte
+        chunks of a line can form a new RFC1918 address while git still reports R100, so a
+        similarity figure must never stand in for "unchanged". Equal blob ids are the only
+        proof of identical content.
+      - `git diff -- old new` takes pathspecs, and pathspecs glob. A crafted name can make git
+        pair a different source than the one this hook checked. Diffing the two blobs by id
+        involves no pathspec and cannot be re-paired.
+
+    `-M` is explicit so `diff.renames` cannot change the answer. A rename git declines to pair
+    (too dissimilar, or past renameLimit) arrives as a plain `A` and is scanned end to end.
+
+    FAIL CLOSED on a git error. Discarding the rc (the old `_, out`) meant a failed
+    `git diff` returned an empty list -> zero files scanned -> the gate PASSED an
+    unscanned commit. That is exactly this file's own stated failure mode: "a detector
+    that will not say what it found cannot be told apart from one that is wrong." A
+    security gate that cannot read the index must BLOCK, never wave the commit through.
+    The same holds for a `-z` record this parser does not recognise.
+    """
+    rc, out = _git_text(["git", "diff", "--cached", "--raw", "-z", "--no-abbrev", "-M",
+                         "--diff-filter=ACMRT"])
     if rc != 0:
-        print("pre-commit[discreet-denylist]: BLOCKED — could not read the staged file list "
-              f"(git diff exit {rc}); refusing to pass an unscanned commit.", file=sys.stderr)
-        sys.exit(1)
-    return [p for p in out.split("\0") if p]
+        _blocked_unreadable(f"git diff exit {rc}")
+    toks, items, i = out.split("\0"), [], 0
+    while i < len(toks):
+        if not toks[i]:
+            i += 1
+            continue
+        m = _RAW.match(toks[i])
+        if not m:
+            _blocked_unreadable(f"unrecognised raw record {toks[i][:12]!r}")
+        old_blob, new_blob, st = m.group(3), m.group(4), m.group(5)
+        npaths = 2 if st in "RC" else 1
+        paths = toks[i + 1:i + 1 + npaths]
+        if len(paths) != npaths or not all(paths):
+            _blocked_unreadable(f"truncated raw record for status {st!r}")
+        i += 1 + npaths
+        if st == "R":
+            items.append((paths[1], paths[0], old_blob, new_blob))
+        elif st == "M":
+            items.append((paths[0], None, old_blob, new_blob))
+        else:
+            # A (new), C (a copy's source still exists, so it is new content), T (a type
+            # change: the old side is a different kind of object): every line is new.
+            items.append((paths[-1], None, None, new_blob))
+    return items
 
 
-def staged_blob(path):
-    r = subprocess.run(["git", "show", f":{path}"], capture_output=True)
+def staged_blob(blob):
+    """Text of a staged blob by id (the exact content being committed), or None if binary."""
+    r = subprocess.run(["git", "cat-file", "blob", blob], capture_output=True)
     if r.returncode != 0:
-        return None
+        return None                    # e.g. a submodule gitlink: not a blob
     raw = r.stdout
     if b"\x00" in raw[:8192]:          # binary — skip
         return None
@@ -544,10 +629,13 @@ def staged_blob(path):
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
-def added_lines(path):
-    """Post-image line numbers this commit ADDS or MODIFIES in `path`.
+def added_lines(old_blob, new_blob):
+    """Post-image line numbers this commit ADDS or MODIFIES, from old blob to new blob.
 
-    Returns None when the answer is not knowable, and None means SCAN EVERYTHING.
+    Returns None when every line counts (old_blob None: a new file, copy, type change, or a
+    move judged whole) or the answer is not knowable, and None means SCAN EVERYTHING.
+    Returns an empty set only on PROOF of identical content: equal blob ids (a pure rename,
+    or a mode-only change, which used to re-judge the whole file on a chmod).
     Fail-closed is the whole design here: an unparseable hunk header must never be
     read as "this commit added nothing", because that silently disarms the guard —
     the invisible-gate failure this repo has already been bitten by twice (the
@@ -566,12 +654,20 @@ def added_lines(path):
     Content already committed and pushed cannot be un-published by refusing the next
     commit; "is the shipped artifact clean?" is answered at build time by the bundle
     scanner, which reads the whole payload. This hook's job is "do not ADD it".
-
-    An ADDED file is entirely added lines, so new files still get scanned end to end.
     """
+    if old_blob is None:
+        return None
+    if old_blob == new_blob:
+        return set()
     # THE crash site: this diff carries the file's own content lines, so a repo with one
-    # Latin-1 file killed the whole hook.
-    rc, out = _git_text(["git", "diff", "--cached", "-U0", "--no-color", "--", path])
+    # Latin-1 file killed the whole hook. Blob to blob: no pathspec, no external diff, no
+    # textconv. Attributes are NOT fully out of play: git matches them against the blob id
+    # as if it were a name, so a catch-all `* -diff` or `* binary` still suppresses hunks.
+    # That lands in the no-hunk branch below, which scans all: the safe direction, and a
+    # test pins it. The trailing `--` stops a worktree file named like a blob id from being
+    # read as a path.
+    rc, out = _git_text(["git", "diff", "-U0", "--no-color", "--no-ext-diff",
+                         "--no-textconv", old_blob, new_blob, "--"])
     if rc != 0:
         return None
     nums, saw_hunk = set(), False
@@ -586,7 +682,7 @@ def added_lines(path):
         count = 1 if m.group(2) is None else int(m.group(2))
         nums.update(range(start, start + count))
     if not saw_hunk:
-        return None                    # no hunks parsed (rename/mode-only) — scan all
+        return None                    # blobs differ but no hunk parsed — scan all
     return nums
 
 
@@ -608,13 +704,22 @@ def main():
 
     violations = []
     let_through = []               # added lines a repo-wide own_subject_extra grant is hiding
-    for path in staged_files():
-        if any(path.startswith(p) for p in SKIP_PREFIXES):
+    for path, renamed_from, old_blob, new_blob in staged_files():
+        checks = _checks_at(path)
+        if checks is None:
             continue
-        text = staged_blob(path)
+        skipped = any(path.startswith(p) for p in SKIP_PREFIXES)   # home-path only here
+        text = staged_blob(new_blob)
         if text is None:
             continue
-        scope = added_lines(path)      # None => judge every line (fail closed)
+        # A file moved OUT of a place judged more leniently (a skipped prefix, or a path
+        # where an own-subject grant exempts a token the new path does not) carries lines
+        # no one ever judged. Diff-scoping would wave them through as "not added", so the
+        # move is judged as if the file were new. Otherwise a rename is a free launder.
+        if renamed_from and (any(renamed_from.startswith(p) for p in SKIP_PREFIXES)
+                             or _exempt_for(renamed_from) - _exempt_for(path)):
+            old_blob = None
+        scope = added_lines(old_blob, new_blob)   # None => judge every line (fail closed)
         # git_lines, NOT splitlines: `scope` is numbered by git, and the two must agree.
         for lineno, line in enumerate(git_lines(text), 1):
             if scope is not None and lineno not in scope:
@@ -622,13 +727,13 @@ def main():
             if PRAGMA in line:
                 continue
             folded = collapse_concats(line)
-            for label, pat in _checks_for(path):
+            for label, pat in checks:
                 if pat.search(line):
                     violations.append((path, lineno, label))
                 elif folded != line and pat.search(folded):
                     violations.append((path, lineno, label + " (split literal)"))
             # Additive diagnostic only — see the _SHADOW block above. Never blocks.
-            if _SHADOW is not None and (_SHADOW.search(line)
+            if not skipped and _SHADOW is not None and (_SHADOW.search(line)
                                         or (folded != line and _SHADOW.search(folded))):
                 let_through.append((path, lineno))
 
@@ -753,7 +858,8 @@ def sweep_one():
         print(f"#   \u26a0 {repo} is on feature branch '{_branch}' — rows below describe that "
               f"branch's state, not the default branch anyone will clone.", file=sys.stderr)
     for path in tracked_files():
-        if any(path.startswith(pref) for pref in SKIP_PREFIXES):
+        checks = _checks_at(path)
+        if checks is None:
             continue
         text = tracked_blob(path)
         if text is None:
@@ -764,7 +870,7 @@ def sweep_one():
             if PRAGMA in line:
                 continue
             folded = collapse_concats(line)
-            for label, pat in _checks_for(path):
+            for label, pat in checks:
                 if pat.search(line) or (folded != line and pat.search(folded)):
                     print(f"{repo}\t{path}:{lineno}\t{label}")
                     break
