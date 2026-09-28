@@ -350,6 +350,39 @@ for _label, _key, _wb in _ARMED:
     CHECKS.insert(0, (_label, _compile_alt(_vals, _wb)))
 
 
+# HOME-DIRECTORY PATHS ARM IN EVERY REPO — the one personal shape the tier above must not gate.
+#
+# The tier keeps `personal_tokens` off in repos nobody has marked as distributing, because
+# the owner's login legitimately appears in a private repo: a `<owner>/<repo>` clone URL, a
+# bundle identifier. A HOME-DIRECTORY PATH has no such use. `/Users/<login>/...` is machine-
+# local and non-portable in every repo, so arming just that shape everywhere does not bring
+# back the work stoppage the tier was built to avoid.
+#
+# Why it exists (2026-09-28): a Claude session wrote its own tool-results cache path,
+# `~/.claude/projects/-Users-<login>-Developer/<session>/...`, into a doc in a private,
+# unclassified repo. The login sits in Claude's PROJECT SLUG there (`/` becomes `-`). The
+# config held the login and `personal-identifier` matches it as a substring, so the slug
+# form was never the problem; the class was simply not armed in that repo, and the commit
+# went through clean. Session scratch paths carry the same slug, so this is the shape
+# residue from an agent actually takes.
+#
+# Derived at runtime from `personal_tokens`, so no value enters this file, and with no
+# config the class is omitted like every other value-bearing class. Separators cover
+# `/Users/`, `/home/`, `C:\Users\`, JSON-escaped `\/Users\/`, the slug's `-Users-`, the
+# classic Mac `HD:Users:<login>:` form AppleScript returns, and URL-encoded `%2FUsers%2F`
+# (the `%2F`/`%5C` lookbehinds stand in for the left boundary, since `F`/`C` are alnum).
+# A home path is never a repo's own subject, so NO own-subject grant exempts it: not
+# own_subject_paths (it is deliberately absent from _CLASS_VALUES, like the structural
+# classes) and not a repo-wide own_subject_extra (hence no `_OWN` filter here). In a
+# distributing repo a hit also fires `personal-identifier`; two labels is accurate.
+_HOME_VALS = _cfg_values("personal_tokens")
+if _HOME_VALS:
+    _SEP = r"(?:[-/\\:]|%2F|%5C)"
+    CHECKS.insert(0, ("home-path", re.compile(
+        r"(?:(?<![A-Za-z0-9])|(?<=%2F)|(?<=%5C))(?:Users|home)" + _SEP + r"+(?:%s)"
+        % "|".join(re.escape(v) for v in _HOME_VALS) + _WB_R, re.IGNORECASE)))
+
+
 # VISIBILITY FOR REPO-WIDE OWN-SUBJECT EXEMPTIONS — the silent hole that leaked (2026-08-19).
 #
 # A repo-wide own-subject grant strips a compartment token from EVERY path in the repo,
