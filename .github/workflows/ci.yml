@@ -1,4 +1,4 @@
-# Fleet CI — Python template. Vendored self-contained via vendor-ci.sh (source: scotty).
+# Python CI template. Vendored self-contained via vendor-ci.sh from the shared CI template repository.
 # EDIT markers: (1) install line, (2) working-directory when the package lives in a subdirectory.
 name: ci
 
@@ -25,7 +25,7 @@ jobs:
       # EDIT (1): pick ONE install path:
       - run: pip install -e '.[dev]'            # has pyproject/setup with a dev extra
       # - run: pip install -r requirements.txt  # requirements-only repos
-      # Lint is ADVISORY until the tree is clean; then DELETE continue-on-error to gate (plan §8 Phase 5).
+      # Lint is ADVISORY until the tree is clean; then DELETE continue-on-error to gate.
       # ruff is installed here so the step reports real findings instead of failing on a missing
       # tool — repos need not carry ruff in their own deps (many ship black/flake8 instead).
       - name: ruff (advisory)

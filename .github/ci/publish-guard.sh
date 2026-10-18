@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# publish-guard.sh — CI file-tracking guard. FLEET-CANONICAL: single source lives in
-# scotty/scripts/ci-templates/; each repo gets a vendored copy at .github/ci/publish-guard.sh
-# via vendor-ci.sh. EDIT HERE and re-vendor — never hand-edit a per-repo copy (drift is the
-# whole thing this replaces: uhura's and captains-log's hand-written guards had diverged).
+# publish-guard.sh — CI file-tracking guard. The single source lives in scripts/ci-templates/
+# of the shared CI template repository; each repo gets a vendored copy at
+# .github/ci/publish-guard.sh via vendor-ci.sh. EDIT THE SOURCE and re-vendor; never hand-edit a
+# per-repo copy (drift is the whole thing this replaces: hand-written per-repo guards diverged).
 #
-# This is LAYER 1 of 3 (ci-reform plan §5). It asserts no secret-bearing FILE is tracked —
+# This is LAYER 1 of 3. It asserts no secret-bearing FILE is tracked —
 # structural, hermetic, runs anywhere. It does NOT scan file CONTENT:
 #   - credential VALUES        -> gitleaks (githooks 10-secret-scan; can also run in CI)
 #   - identifier LEAKS         -> the local 15-discreet-denylist hook, which stores no values
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # Real secret/config files that must never be tracked; the *.example|sample|template
-# siblings are allowed. `tokens.json` is matched both inside a tokens/ dir AND as a bare
+# variants are allowed. `tokens.json` is matched both inside a tokens/ dir AND as a bare
 # filename at any path (else a tracked config/tokens.json slips through). Keep this pattern
 # equal to any inline copy; CANONICAL.sha256 + audit tooling detect drift.
 bad=$(git ls-files \
@@ -21,7 +21,7 @@ bad=$(git ls-files \
   | grep -vE '(^|/)\.env\.(example|sample|template)$' || true)
 
 # Per-repo escape hatch: .github/ci/publish-guard-allow lists globs for VERIFIED-benign
-# matches — e.g. a PUBLIC key that must be published (Tesla .well-known/*.pem). One glob per
+# matches — e.g. a PUBLIC key that must be published (a .well-known/*.pem). One glob per
 # line; blank lines and #comments ignored. Strict-by-default with an explicit, auditable
 # allowlist (mirrors the gitleaks .gitleaks.toml and the hooks' denylist:ignore philosophy).
 ALLOW=".github/ci/publish-guard-allow"

@@ -1,11 +1,13 @@
-# Fleet CI — universal GUARD workflow. Vendored self-contained via vendor-ci.sh (source: scotty).
-# This is the publish-readiness guard EVERY live repo gets (ci-reform Phase 1). It carries the two
-# CI-enforceable layers of the three-layer model (plan §5):
+# Universal publish-readiness GUARD workflow. Vendored self-contained via vendor-ci.sh from the
+# shared CI template repository; edit it there and re-vendor, never in a consuming repo. Every
+# repo that vendors CI gets this workflow. It carries the two CI-enforceable layers of a
+# three-layer guard model:
 #   layer 1  publish-guard  — no secret-bearing FILE is tracked (structural; runs .github/ci/publish-guard.sh)
 #   layer 2  secret-scan    — gitleaks scans file CONTENT for credential VALUES (backstop for the
 #                             local 10-secret-scan hook, for when that hook was bypassed/absent)
 # layer 3 (identifier LEAKS, the 15-discreet-denylist hook) is LOCAL-ONLY by design — it stores no
-# values and fails open, so CI cannot enforce it and does not pretend to. "private now, public-ready always."
+# values and fails open, so CI cannot enforce it and does not pretend to. The aim is a private repo
+# that is ready to publish at any time.
 name: guard
 
 on:
