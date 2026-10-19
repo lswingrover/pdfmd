@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# session-worktree.sh — create a session-scoped git worktree so a Cowork/Claude
-# session never builds or commits in a working tree another session owns.
+# session-worktree.sh: create a session-scoped git worktree so a work session (a person
+# or an AI coding agent) never builds or commits in a working tree another session owns.
 #
-# Why: concurrent sessions in one checkout race each other — parallel rebuilds,
+# Why: concurrent sessions in one checkout race each other: parallel rebuilds,
 # clobbered uncommitted work, HEAD moving underneath. A worktree gives this session
-# its own working dir + index + HEAD while sharing the object store. See
-# dev-policy.md §2 (Session isolation) and
-# ~/Documents/Claude/preferences/operating-principles.md § Branch-state discipline.
+# its own working dir + index + HEAD while sharing the object store.
 #
 # This is the FULL bootstrap: it doesn't just `git worktree add`, it makes the new
-# worktree immediately runnable — copies the untracked essentials git leaves behind
+# worktree immediately runnable: it copies the untracked essentials git leaves behind
 # (.env etc.) and installs project dependencies. A fresh worktree that won't build is
-# the #1 reason worktree discipline gets abandoned.
+# the main reason worktree discipline gets abandoned.
 #
 # Usage:
 #   bash scripts/session-worktree.sh <branch> [options]
@@ -38,7 +36,7 @@ die() { echo "session-worktree: $*" >&2; exit 1; }
 note() { echo "session-worktree: $*"; }
 
 # Print the worktree path that currently has <branch> checked out, if any.
-# git allows a branch in only ONE worktree — this lets us fail friendly instead of
+# git allows a branch in only ONE worktree; this lets us fail friendly instead of
 # dumping a raw `fatal: '<branch>' is already used by worktree at ...`.
 existing_wt_for_branch() {
   git -C "$ROOT" worktree list --porcelain | awk -v b="refs/heads/$1" '
@@ -70,16 +68,15 @@ NAME=$(basename "$ROOT")
 SBR=$(printf '%s' "$BRANCH" | tr '/' '-')
 
 # --- Resolve this repo's integration branch as a remote-tracking ref (origin/<branch>) ---
-# origin/HEAD is the WRONG signal on this fleet: it mirrors the remote's DEFAULT branch (main),
-# but dev-first repos integrate on 'dev'. Resolve, in order: (1) explicit
+# origin/HEAD alone is the WRONG signal: it mirrors the remote's DEFAULT branch (main), but
+# dev-first repos integrate on 'dev'. Resolve, in order: (1) explicit
 # override git config session.integrationBranch; (2) first EXISTING of origin/dev, origin/staging
-# (exact refs); (3) origin/HEAD. Kept byte-identical to new-session.sh — resolve once, both paths.
+# (exact refs); (3) origin/HEAD. Kept identical to new-session.sh: one rule, both paths.
 resolve_base_ref() {
   local d="${1:-.}" cfg cand def
   cfg=$(git -C "$d" config --get session.integrationBranch 2>/dev/null || true)
-  # Legacy key, read-only fallback. Renamed 2026-08-02 to drop an org prefix from a
-  # generic setting; no repo on this fleet sets either, but a clone elsewhere might, and
-  # silently ignoring a config someone set is worse than carrying two lines.
+  # Legacy key name, read as a fallback so a clone configured under the old name keeps
+  # working; silently ignoring a config someone set is worse than carrying two lines.
   [ -z "${cfg:-}" ] && cfg=$(git -C "$d" config --get ag.integrationBranch 2>/dev/null || true)
   if [ -n "$cfg" ] && git -C "$d" show-ref --verify --quiet "refs/remotes/origin/$cfg"; then
     printf 'origin/%s\n' "$cfg"; return 0
@@ -107,7 +104,7 @@ if git -C "$ROOT" worktree list --porcelain | grep -qx "worktree $DEST"; then
   echo "WORKTREE: $DEST"
   exit 0
 fi
-[ -e "$DEST" ] && die "destination $DEST already exists but is not a registered worktree — refusing to clobber"
+[ -e "$DEST" ] && die "destination $DEST already exists but is not a registered worktree; refusing to clobber"
 
 # Does the branch already exist (local or remote)?
 BRANCH_EXISTS=0
@@ -126,7 +123,8 @@ if [ "$BRANCH_EXISTS" -eq 1 ]; then
   git -C "$ROOT" worktree add "$DEST" "$BRANCH"
 else
   # New branch: base it on --ref, else origin/<branch> (won't exist here), else the
-  # resolved integration branch (resolve_base_ref: dev-first->dev, ent-d->staging, else origin/HEAD).
+  # resolved integration branch (resolve_base_ref: dev-first->dev, staging-first->staging,
+  # else origin/HEAD).
   if [ -z "$REF" ]; then
     DEFREF=$(resolve_base_ref "$ROOT" || echo "origin/main")
     REF="$DEFREF"

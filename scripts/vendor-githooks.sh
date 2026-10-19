@@ -1,35 +1,30 @@
 #!/usr/bin/env bash
-# vendor-githooks.sh — vendor the canonical git-hook dispatcher set from scotty
-# (the PERSONAL-fleet source of truth) into THIS repo, then activate it. Run once per
-# clone; re-run to update. Pin SCOTTY_GITHOOKS_REF to a tag/SHA for reproducibility.
+# vendor-githooks.sh: vendor the git-hook dispatcher set (scripts/githooks/ plus the
+# helper scripts named in HELPERS below) from its source repository into THIS repo,
+# then activate it. Run once per clone; re-run to update. Pin GITHOOKS_SOURCE_REF to a
+# tag/SHA for reproducibility.
 #
-# scotty is the source of truth for this fleet's hooks. Keeping the canonical set here
-# means the tree is self-contained: no repo needs access to any other organisation to
-# install its own guards. That independence was won, not given — the previous source
-# lived behind a private org, so losing access to it would have broken every install.
-# Doctrine mirror: operating-principles.md § Branch-state discipline.
-#
-# Why vendor (not hand-copy): one source of truth in scotty/scripts/githooks/ — no
-# drift across repos. Why this set: composable dispatchers (pre-commit / pre-push run
-# every executable in their *.d/ dir), so a repo adds its own checks as a fragment
-# without touching the universal base. Why git-native: the shared-checkout + main-guard
-# fragments fire in Cowork AND Claude Code CLI, unlike the Bash-only PreToolUse hooks.
-# Guard origin: obrien #39.
+# Why vendor (not hand-copy, not reference): one source of truth, byte-identical copies
+# everywhere (CANONICAL.sha256 checks it), and each consuming repo stays self-contained:
+# once vendored, installing its own guards needs no access to any other repository.
+# Why this set: composable dispatchers (pre-commit / pre-push run every executable in
+# their *.d/ dir), so a repo adds its own checks as a fragment without touching the
+# universal base. Why git-native: the shared-checkout and main-guard fragments fire for
+# every commit and push however git is invoked, unlike agent-side tool hooks, which only
+# see commands run through the agent's own shell tool.
 set -euo pipefail
 
-# SELF-UPDATE SAFETY — must stay the first thing this script does.
+# SELF-UPDATE SAFETY: must stay the first thing this script does.
 #
 # This script is in its own HELPERS list, so a re-vendor overwrites the file that is
 # currently executing. Bash reads a script incrementally, BY BYTE OFFSET; it does not
 # hold the whole text in memory. Replacing the file mid-run therefore makes the parser
 # resume at the wrong place in the new text.
 #
-# Observed 2026-07-31, vendoring the discreet-denylist hook to the fleet: this file grew
-# by three lines, bash resumed mid-token and died with
-#     vendor-githooks.sh: line 44: syntax error near unexpected token `do'
-# AFTER the fragment loop had already run from the OLD BASE_FRAGS. So the new hook was
-# never fetched, seven "vendored:" lines had already printed, and it looked like it
-# worked. Any future change to this file's LENGTH would do the same in every repo.
+# If the new version differs in LENGTH, bash resumes mid-token and dies with a syntax
+# error such as `syntax error near unexpected token `do'`, AFTER the fragment loop has
+# already run from the OLD file lists. A newly added hook is then never fetched, several
+# "vendored:" lines have already printed, and the run looks like it worked.
 #
 # Fix: re-exec from an immutable private copy, so the running text cannot change under
 # us no matter what the fetch writes. $0 is used nowhere below (paths come from `git
@@ -42,45 +37,43 @@ if [ -z "${VENDOR_GITHOOKS_SELF:-}" ]; then
 fi
 trap 'rm -f "${VENDOR_GITHOOKS_SELF:-}"' EXIT
 
-# WHERE THE CANONICAL HOOKS COME FROM — configured, never committed.
+# WHERE THE HOOKS COME FROM: configured, never committed.
 #
-# This was `${SCOTTY_REPO:-<owner>/scotty}` carrying a per-line denylist:ignore. The
-# commit hook honoured that pragma; the plugin BUILD gate did not, and the build gate
-# was right. This file ships inside a plugin that gets given away, so a baked-in
-# default points a recipient's vendoring at somebody else's repository — they would
-# either pull hooks from an account they have nothing to do with, or get a 404 with no
-# way to interpret it. "Irreducible" was the wrong call: what is irreducible is that
-# the script needs A source, not that the source is spelled out here.
+# This file is copied into every consuming repo and may be redistributed further, so a
+# baked-in default would point a recipient's vendoring at somebody else's repository:
+# they would either pull hooks from an account they have nothing to do with, or get a
+# 404 with no way to interpret it. The script needs A source, not a particular one.
 #
-# Resolution order (dev-policy.md §8b):
-#   1. $SCOTTY_REPO                    — explicit override, wins
-#   2. ~/.config/githooks/source-repo  — one line, "<owner>/<repo>"
+# Resolution order:
+#   1. $GITHOOKS_SOURCE_REPO           explicit override, wins (legacy name: $SCOTTY_REPO)
+#   2. ~/.config/githooks/source-repo  one line, "<owner>/<repo>"
 #   3. hard error naming exactly what to set
 #
 # Deliberately NO default. A wrong default is worse than none here: it fails in the one
-# direction nobody checks — successfully vendoring the wrong thing, quietly.
+# direction nobody checks, successfully vendoring the wrong thing, quietly.
 _cfg_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-SRC_REPO="${SCOTTY_REPO:-}"
+SRC_REPO="${GITHOOKS_SOURCE_REPO:-${SCOTTY_REPO:-}}"
 if [ -z "$SRC_REPO" ] && [ -r "$_cfg_home/githooks/source-repo" ]; then
   SRC_REPO=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$_cfg_home/githooks/source-repo" | grep -v '^$' | head -1)
 fi
 if [ -z "$SRC_REPO" ]; then
   cat >&2 <<ERR
-vendor-githooks: no canonical hook source configured.
+vendor-githooks: no hook source repository configured.
 
   Set one of:
-    export SCOTTY_REPO="<owner>/<repo>"
+    export GITHOOKS_SOURCE_REPO="<owner>/<repo>"
   or write it once:
     mkdir -p "$_cfg_home/githooks"
     echo "<owner>/<repo>" > "$_cfg_home/githooks/source-repo"
 
-  <owner>/<repo> is the GitHub repo holding the canonical scripts/githooks/ set.
+  <owner>/<repo> is the GitHub repo holding the source scripts/githooks/ set.
   There is deliberately no default: vendoring from the wrong repo would succeed
   quietly, which is the one failure mode a guard-installer must not have.
 ERR
   exit 1
 fi
-REF="${SCOTTY_GITHOOKS_REF:-main}"          # pin to a tag/SHA for reproducible vendoring
+# Pin to a tag/SHA for reproducible vendoring (legacy name: SCOTTY_GITHOOKS_REF).
+REF="${GITHOOKS_SOURCE_REF:-${SCOTTY_GITHOOKS_REF:-main}}"
 SUBPATH="scripts/githooks"
 # Vendored alongside the hooks so the dispatcher base + universal fragments + the
 # auto-push ("remote control") + the installer + the session helpers all travel
@@ -106,7 +99,7 @@ for f in $BASE_FRAGS; do fetch "$SUBPATH/$f" "$ROOT/$SUBPATH/$f" +x; done
 for f in $HELPERS;   do fetch "$f"          "$ROOT/$f"          +x; done
 
 # If the consuming repo gitignores *.d (a common Make/C/Swift convention), the dispatcher
-# fragment dirs (pre-commit.d/, pre-push.d/) get silently dropped at `git add` time — the
+# fragment dirs (pre-commit.d/, pre-push.d/) get silently dropped at `git add` time, and the
 # dispatchers would ship WITHOUT their guards (no main-guard / secret-scan / shared-checkout).
 # Add a durable .gitignore exception so that can't happen. Idempotent.
 for d in pre-commit.d pre-push.d; do
@@ -120,12 +113,23 @@ done
 
 # Record provenance so drift from the source is detectable later.
 gh api "repos/$SRC_REPO/commits/$REF" --jq '.sha' > "$ROOT/$SUBPATH/.githooks-ref"
-echo "pinned scotty ref: $(cat "$ROOT/$SUBPATH/.githooks-ref")"
+echo "pinned source ref: $(cat "$ROOT/$SUBPATH/.githooks-ref")"
 
 # Integrity: the vendored base must match the canonical checksums it shipped with.
 ( cd "$ROOT/$SUBPATH" && shasum -a 256 -c CANONICAL.sha256 ) \
-  || { echo "vendor-githooks: vendored base failed CANONICAL.sha256 — aborting" >&2; exit 1; }
+  || { echo "vendor-githooks: vendored base failed CANONICAL.sha256; aborting" >&2; exit 1; }
 
-# Activate for this clone + every worktree (sets core.hooksPath; no .git/hooks copy).
-bash "$ROOT/scripts/install-git-hooks.sh"
+# Arm for this clone + every worktree (no .git/hooks copy). The installer keeps the
+# current value, sets the relative one, or refuses when no value would arm every
+# worktree. Its output is shown as-is. Exit 3 (no worktree is without hooks, but not all
+# run the vendored set) is a warning; exit 1 (some worktree runs no hooks at all) fails
+# this script, because "vendored" must never read as "running" when it is not.
+hooks_rc=0
+bash "$ROOT/scripts/install-git-hooks.sh" || hooks_rc=$?
+case "$hooks_rc" in
+  0) ;;
+  3) echo "vendor-githooks: warning: vendored, but not every worktree runs the vendored set (see above)." >&2 ;;
+  *) echo "vendor-githooks: files vendored and verified, but some worktree runs NO hooks at all (see above)." >&2
+     exit 1 ;;
+esac
 echo "done. commit the vendored scripts/githooks/ + scripts/ helpers so teammates inherit them."

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Canonical pre-push dispatcher — runs every executable in ./pre-push.d/.
+# pre-push dispatcher: runs every executable in ./pre-push.d/, in name order.
 # "Universal base + pluggable per-repo checks": add a repo check as a pre-push.d/
 # fragment without editing this file. Each fragment receives the push args ("$@")
 # and the ref list on stdin; any fragment exiting non-zero aborts the push.
 #
-# The universal base fragment is pre-push.d/10-main-guard (blocks direct origin/main
-# pushes unless ALLOW_MAIN_PUSH=1; PR-merge flow unaffected).
+# The universal base fragment is pre-push.d/10-main-guard (blocks a direct push to a
+# promote-only main unless ALLOW_MAIN_PUSH=1; the PR-merge flow is unaffected).
 #
-# Canonical source: this repo's scripts/githooks/ (see the dev policy, Session isolation).
-# Activate once per clone: bash scripts/install-git-hooks.sh
+# Part of a vendored hook set: edit the source copy and re-vendor rather than editing
+# here (CANONICAL.sha256 pins these bytes). Activate once per clone:
+#   bash scripts/install-git-hooks.sh
 set -eu
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 D="$HERE/pre-push.d"
@@ -17,9 +18,9 @@ D="$HERE/pre-push.d"
 input=$(cat)
 for frag in "$D"/*; do
   # Regular files only. A DIRECTORY carries the exec bit, so a bare -x test runs it
-  # and the dispatcher aborts with 126 — blocking every commit/push in the repo.
-  # Observed 2026-07-28: a stray pre-commit.d/__pycache__/ (any python import of a
-  # fragment creates one) took the whole hook down. Fail-safe: skip non-files.
+  # and the dispatcher aborts with 126, blocking every commit/push in the repo. A stray
+  # pre-commit.d/__pycache__/ (Python creates one whenever anything imports a fragment)
+  # is enough to do that. Fail-safe: skip non-files.
   [ -f "$frag" ] && [ -x "$frag" ] || continue
   printf '%s\n' "$input" | "$frag" "$@" || exit $?
 done

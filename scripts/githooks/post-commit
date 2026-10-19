@@ -1,23 +1,25 @@
-
-# ── PUSH FAILURE MUST LEAVE A TRACE ──────────────────────────────────────────────────
-# This hook used to push with `( git push … >/dev/null 2>&1 & ) >/dev/null 2>&1` —
-# detached, both streams discarded, exit code unexaminable — and this header used to call
-# a failed push "silent and harmless". It is neither.
+#!/usr/bin/env bash
+# post-commit: auto-publish the current branch to origin ("remote control").
 #
-# 2026-08-01: ELEVEN consecutive pushes failed across the fleet and produced not one byte
-# of signal. Every one of eleven repos held a commit that existed on no remote ref at all.
-# Stranded work is indistinguishable from pushed work, so nobody looked for a month's
-# worth of it until an audit asked git directly.
+# Part of the "1 branch = 1 worktree = 1 session" model: every unit of work is backed
+# up to its own origin/<branch> the moment it is committed, so nothing sits stranded
+# in a local worktree where a deleted directory or a dead disk would take it.
 #
-# The push stays BACKGROUNDED and NON-BLOCKING — that part was a correct decision, a hook
-# must not make you wait on the network. What changes is that failure now leaves a durable
-# trace instead of evaporating: a per-repo marker plus an appended log line. Success is
-# still completely silent, and the marker is removed on a later success so it can never go
-# stale and cry wolf.
+# Scope: feature/session branches are pushed to origin/<branch>. Trunk branches
+# (main, master, staging, dev) are never published by this hook; they are mirrored to
+# refs/backup/<branch> instead (see below). main is also covered by the pre-push guard.
 #
-# Read them with:  cat ~/.claude/push-failures/*.log
-# The fleet audit (scotty scripts/audit-vendored-githooks.sh) independently detects the
-# EFFECT — a commit on no remote. These markers record the CAUSE.
+# NON-BLOCKING, BUT NEVER SILENT ON FAILURE. The push runs in the background so the
+# commit returns immediately; a hook must not make you wait on the network. A failed
+# push is not discarded, though: stranded work looks exactly like pushed work, so a
+# push failure that leaves no trace goes unnoticed until someone asks git directly.
+# On failure the hook writes a per-repo marker plus a line in a shared log; a later
+# successful push removes the marker, so it cannot go stale and cry wolf. Success is
+# completely silent.
+#
+# Read failures with:  cat ~/.claude/push-failures/*.log
+#
+# Install with: bash scripts/install-git-hooks.sh
 _pushfail_dir="$HOME/.claude/push-failures"
 
 _push_and_record() {   # $1 = refspec/branch args, $2 = human label
@@ -35,37 +37,19 @@ _push_and_record() {   # $1 = refspec/branch args, $2 = human label
 }
 
 _slug="$(printf '%s' "$PWD" | tr '/' '_' | sed 's/^_//').log"
-#!/usr/bin/env bash
-# post-commit: auto-publish the current branch to origin ("remote control").
-#
-# Part of the 1 branch = 1 worktree = 1 session model (the personal dev-policy, Session isolation):
-# every session's work is backed up to its own origin/<branch> the moment it is
-# committed, so nothing sits stranded in a local worktree (the failure mode that
-# nearly lost the person_contacts WIP on 2026-06-19).
-#
-# Scope: feature/session branches only. The trunk branches (main, staging) are
-# pushed deliberately by the coordinator, never auto-pushed. main is also blocked
-# by the pre-push guard.
-#
-# Best-effort and non-blocking: it backgrounds the push and never fails the
-# commit, so a network hiccup or a non-fast-forward race is silent and harmless.
-# Install with: bash scripts/install-git-hooks.sh
 
 branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || exit 0
 [ -z "$branch" ] && exit 0
 case "$branch" in
   main | master | staging | dev)
-    # TRUNK COMMITS STILL GET AN OFF-MACHINE COPY — just not by publishing the trunk.
+    # TRUNK COMMITS STILL GET AN OFF-MACHINE COPY, just not by publishing the trunk.
     #
-    # Skipping trunks entirely was correct about one thing (a trunk should be pushed
-    # deliberately, not by a hook) and wrong about another: it left work committed
-    # directly to a trunk in a shared checkout with NO backup at all. On 2026-07-30 an
-    # audit found 12 such commits across three repos existing nowhere but this Mac —
-    # 10 of them a session's feature work — precisely because the safety net everyone
-    # relies on has a hole exactly where the shared-checkout risk is highest.
+    # A trunk should be pushed deliberately, not by a hook. But skipping trunks
+    # entirely leaves work committed directly to a trunk (typically in a shared
+    # checkout, where the risk is highest) with no backup at all.
     #
-    # So: mirror the trunk to refs/backup/<branch> instead. That is a real off-machine
-    # copy, it does NOT move origin/<trunk>, it does not open a PR or trigger CI, and it
+    # So mirror the trunk to refs/backup/<branch> instead. That is a real off-machine
+    # copy; it does NOT move origin/<trunk>, does not open a PR or trigger CI, and
     # cannot trip pre-push.d/10-main-guard (which matches on the DESTINATION ref
     # refs/heads/main, not on what is being pushed). Force-updated because it is a
     # mirror of local state, not a branch anyone builds on.
@@ -75,7 +59,6 @@ case "$branch" in
     exit 0 ;;
 esac
 
-# Background push; detach fully so the commit returns immediately and the hook
-# never reports a failure.
+# Feature branch: background push; a failure is recorded as described above.
 _push_and_record "-u origin $branch" "feature-branch:$branch"
 exit 0
