@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
-"""15-discreet-denylist — HARD-BLOCK commits that stage discreet / personal identifiers.
+"""15-discreet-denylist: HARD-BLOCK commits that add private identifiers.
 
 Independent of gitleaks (10-secret-scan): gitleaks catches credential VALUES; this
-catches identifier LEAKS that are not secrets but must never reach an externally-distributed
-or mirror-synced artifact — the owner's private compartment names, personal launchd label,
-home path, RFC1918 topology, localhost:port gateway refs, and known gateway hosts.
+catches identifier LEAKS that are not secrets but must never reach a shared, mirrored, or
+distributed artifact: configured private project names ("compartments"), the machine
+owner's login and name, home-directory paths, private (RFC1918) network addresses,
+localhost:port service references, and configured service hostnames.
 
 Scans the lines THIS COMMIT ADDS, in every added/modified/renamed/type-changed text file.
 Content is read from the staged blob by id so line numbers match what is being committed,
 but only post-image lines named by a blob-to-blob `git diff -U0` are judged (see
-added_lines(); when that cannot be determined the whole blob is scanned — fail closed).
+added_lines(); when that cannot be determined the whole blob is scanned: fail closed).
 An added file is entirely added lines, so new files are still scanned end to end. Any hit
-aborts the commit (exit 1). Prints file + line + which class fired — never the matched
-value — so this hook itself never echoes the sensitive string.
+aborts the commit (exit 1). Prints file + line + which class fired, never the matched
+value, so this hook itself never echoes the sensitive string.
 
 A repo-wide own-subject exemption (a plain-list `own_subject_extra` entry with no
-`own_subject_paths` narrowing) silently disarms the compartment class on that repo's
-shipping paths too — the hole that leaked a compartment name into CI templates, caught
-2026-08-19. Such exemptions are still honoured (they are a supported form), but
-every added line one is hiding is now surfaced as a NON-BLOCKING note, never left silent.
+`own_subject_paths` narrowing) also disarms the compartment class on that repo's
+shipping paths. Such exemptions are still honored (they are a supported form), but
+every added line one is hiding is surfaced as a NON-BLOCKING note, never left silent.
 
-This gate answers "do not ADD a discreet identifier". "Is the shipped ARTIFACT clean?" is
-a different question, answered at build time by the bundle scanner over the whole payload —
+This gate answers "do not ADD a private identifier". "Is the shipped ARTIFACT clean?" is
+a different question, answered at build time by scanning the whole built payload;
 refusing today's commit cannot un-publish a line that shipped last month anyway.
 
-Skips: binary blobs and any line carrying a `denylist:ignore` pragma. NOTHING ELSE is
-exempt — not even this dir (see SKIP_PREFIXES). Adjacent/`+`-joined string literals are
-folded and re-scanned, so splitting a value to evade the scan does not work.
+Line-level skips: binary blobs and any line carrying a `denylist:ignore` pragma. Path-level
+skips are limited to paths a build never packages (SKIP_PREFIXES, which home-path partly
+overrides); this hook's own directory is never skipped. Adjacent/`+`-joined string
+literals are folded and re-scanned, so splitting a value to evade the scan does not work.
 Loud, explicit bypass for genuine exceptions:
-    OBRIEN_ALLOW_DENYLIST=1 git commit ...
-Root cause it guards: obrien.plugin shipped compartment names to an outside team (2026-07-15).
+    ALLOW_DENYLISTED_COMMIT=1 git commit ...
 """
 import os
 import re
@@ -40,20 +40,15 @@ PRAGMA = "denylist:ignore"
 
 # NO SENSITIVE VALUE IS STORED IN THIS FILE.
 #
-# Until 2026-07-23 the compartment tokens lived here, split into character literals so
-# this file would not trip its own scan. That defeated grep, not a reader — and this
-# repo mirrors in full to an org-visible destination, which is precisely the audience
-# the veil exists against. The owner's username and launchd label were embedded the
-# same way until 2026-07-28.
+# Splitting a value into character literals so this file does not trip its own scan
+# defeats grep, not a reader. More generally, any scheme that lets a guard MATCH a secret
+# lets a reader RECOVER it, because the guard must be able to test candidates: splitting,
+# hashing and encoding are all recoverable (hashed single words fall to an ordinary
+# dictionary attack in well under a second). A repo may later be mirrored or published to
+# a wider audience, so the only durable answer is that the value never enters the file.
 #
-# The general rule (operating-principles.md, "A detector cannot hide its own secret"):
-# any scheme that lets a guard MATCH a secret lets a reader RECOVER it, because the
-# guard must be able to test candidates. Splitting, hashing and encoding are all
-# recoverable — a sibling repo's SHA-256 word-hashes fell to the stock system
-# dictionary in 0.13s. The only durable answer is that the value never enters the file.
-#
-# Values now load at runtime from an un-shipped local config. Absent (or partial)
-# config, the affected class is simply omitted and every other class still applies —
+# Values load at runtime from an untracked local config. Absent (or partial)
+# config, the affected class is simply omitted and every other class still applies:
 # FAIL OPEN, so CI, foreign clones and teammates get a working guard carrying nothing.
 GUARD_CFG = os.path.expanduser("~/.config/claude-guards/compartments.json")
 
@@ -77,10 +72,8 @@ def _cfg_values(key):
 #     FOO_<value>_PATH = "..."      <- `\b` finds NOTHING here
 #
 # That is the single most common shape residue actually takes (module-level path
-# constants, ALL-CAPS env names, generated identifiers). Measured across four repos
-# on 2026-08-02: this class read 0 with `\b` in a repo where a substring pass found
-# 5, and every one of the five sat inside an ALL-CAPS underscore-joined name. The
-# hook reported the tree clean.
+# constants, ALL-CAPS env names, generated identifiers), so a `\b`-anchored pattern
+# reports such a tree clean when it is not.
 #
 # `_WB_L`/`_WB_R` define the boundary as "not adjacent to an ALPHANUMERIC" instead.
 # Strictly wider than `\b`, never narrower:
@@ -115,10 +108,10 @@ def _alternation(key, word_bounded=True):
 # (class label, compiled pattern). Structural patterns only — every value-bearing
 # class is loaded from config above. Nothing here names a compartment, a personal
 # login, a home path, or any other value this guard exists to catch.
-# ALWAYS-ON structural classes. These describe the OWNER'S actual environment, so they
-# are a leak wherever they land:
-#   rfc1918-ip   — a private address describes this person's real network
-#   gateway-host — names a specific external service this fleet talks to
+# ALWAYS-ON classes. These describe the machine owner's real environment, so they are a
+# leak wherever they land:
+#   rfc1918-ip   - a private address describes a real network
+#   gateway-host - (config-sourced, armed below) names a specific service host in use
 CHECKS = [
     ("rfc1918-ip", re.compile(
         r"\b(?:192\.168\.\d{1,3}\.\d{1,3}"
@@ -130,16 +123,15 @@ CHECKS = [
 # classes below, and for the same reason.
 #
 # The loopback address is IDENTICAL on every machine on earth. It describes nothing
-# about this owner, this network, or this person; a local MCP server binding loopback
-# is simply how a local MCP server works. A port number is mildly interesting only in
+# about the owner, the network, or any person; a local server binding loopback is
+# simply how a local server works. A port number is mildly interesting only in
 # something that ships.
 #
-# Armed everywhere, these two produced pure false positives and taught people to reach
-# for the bypass: they already forced one repo's maintainer to bypass the hook to edit
-# seven files, and they blocked a scrub commit in a repo whose whole function is a
-# loopback-bound daemon, firing on its HOST constant. A guard that fires on that is not
-# protecting anything — it is training its own operator to ignore it, which is the
-# failure that matters, because the RFC1918 rule above is real.
+# Armed everywhere, these two produce pure false positives and teach people to reach
+# for the bypass: ordinary edits get blocked, including in a repo whose whole function
+# is a loopback-bound daemon, where they fire on its HOST constant. A guard that fires
+# on that is not protecting anything; it is training its own operator to ignore it,
+# which is the failure that matters, because the RFC1918 rule above is real.
 _STRUCTURAL_WHEN_DISTRIBUTING = [
     ("loopback-bind", re.compile(r"\b127\.0\.0\.1(?::\d+)?\b")),
     ("localhost-port", re.compile(r"\blocalhost:\d{2,5}\b")),
@@ -152,15 +144,14 @@ def _git_text(args, cwd=None):
     as text (no NUL in the first 8k, so it appears in a diff with real content lines) can
     still hold Latin-1 bytes, and so can a path.
 
-    Observed 2026-08-19: staging a file of `ISO-8859 text` made this hook die with a raw
-    traceback ending `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff`. It failed
-    CLOSED — the commit was blocked, so no guard-open hole — but the operator got a Python
-    stack instead of a verdict, which is indistinguishable from the guard being broken. That
-    is the failure mode this fleet keeps paying for: a detector that will not say what it
-    found cannot be told apart from one that is wrong.
+    With a strict decode, staging an `ISO-8859 text` file kills this hook with a raw
+    traceback ending `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff`. That fails
+    CLOSED (the commit is blocked, so no guard-open hole), but the operator gets a Python
+    stack instead of a verdict, which is indistinguishable from the guard being broken. A
+    detector that will not say what it found cannot be told apart from one that is wrong.
 
-    `staged_blob()` below already had this right (bytes, then errors="replace"). The file was
-    inconsistent with itself, which is why the crash survived every earlier pass over it.
+    `staged_blob()` and `tracked_blob()` below decode the same way (bytes, then
+    errors="replace"). Keep every decode in this file consistent.
     """
     r = subprocess.run(args, capture_output=True, cwd=cwd)
     return r.returncode, r.stdout.decode("utf-8", errors="replace")
@@ -172,11 +163,10 @@ def _this_repo_name():
     """Canonical repo name for the tree being committed to, or '' if undeterminable.
 
     `--show-toplevel` in a worktree returns the WORKTREE path, whose basename is
-    `<repo>-wt-<slug>`, not `<repo>`. Since every unit of work on this fleet happens in
-    a worktree (1 branch = 1 worktree = 1 session), naive basename matching would fail
-    to classify literally every real commit — arming the wrong tier in the one place it
-    is always read. Prefer the common dir, which points at the parent .git; fall back to
-    stripping the -wt- suffix.
+    `<repo>-wt-<slug>`, not `<repo>`. Where work happens in worktrees (one branch per
+    worktree), naive basename matching would fail to classify every commit made there,
+    arming the wrong tier exactly where most commits happen. Prefer the common dir,
+    which points at the parent .git; fall back to stripping the -wt- suffix.
     """
     try:
         rc, out = _git_text(["git", "rev-parse", "--path-format=absolute",
@@ -190,8 +180,8 @@ def _this_repo_name():
         name = os.path.basename(out.strip()) if rc == 0 else ""
         return name.split("-wt-")[0]
     except Exception as exc:
-        # DO NOT fail silently here. An empty repo name disarms every repo-keyed tier —
-        # own_subject_extra and distributing_repos both look this repo up by name — so a
+        # DO NOT fail silently here. An empty repo name disarms every repo-keyed tier
+        # (own_subject_extra and distributing_repos both look this repo up by name), so a
         # swallowed exception turns the owner/personal classes off with no trace. Say so.
         print(f"pre-commit[discreet-denylist]: WARNING — could not determine the repo name "
               f"({exc.__class__.__name__}); repo-keyed exemptions and the personal/owner "
@@ -201,24 +191,23 @@ def _this_repo_name():
 
 _REPO = _this_repo_name()
 
-# TWO TIERS. The compartment class runs in every repo; the owner/personal classes run
-# only in repos that build a DISTRIBUTED artifact, listed under `distributing_repos` in
-# the guard config.
+# TWO TIERS. The compartment and gateway-host classes run in every repo; the
+# owner/personal classes run only in repos that build a DISTRIBUTED artifact, listed
+# under `distributing_repos` in the guard config.
 #
-# Why, measured 2026-07-31 when this hook was vendored beyond obrien for the first time:
-# with all three classes armed everywhere, 375 tracked files across 27 repos would have
-# refused to commit on touch — 49 of MacWatch's 110, 15 of 28 in another. That is not a
-# gate, it is a work stoppage, and this hook's own docstring already warns that blanket
-# pragma-papering "does not scale and trains people to add one reflexively instead of
-# reading the hit". The compartment class alone: 48 files, and all 48 are real.
+# Why: with every class armed everywhere, a large share of the tracked files in ordinary
+# private repos refuse to commit on touch. That is not a gate, it is a work stoppage, and
+# blanket pragma-papering (see SKIP_PREFIXES) does not scale and trains people to add one
+# reflexively instead of reading the hit. The compartment class alone fires rarely, and
+# when it fires the hit is real.
 #
-# The asymmetry is not a compromise, it is the actual threat model. A compartment name
-# is a veil breach wherever it lands, because the veil is about WHO MAY KNOW a thing
-# exists. The owner's own username in his own private repo is not a breach at all — a
-# ship skill must name <owner>/<repo> to clone it, and a macOS bundle identifier
-# legitimately contains it. It becomes a breach only in something that ships.
+# The asymmetry is the actual threat model. A compartment name is a leak wherever it
+# lands, because the point is to control WHO MAY KNOW a thing exists. The owner's own
+# login in the owner's own private repo is not a leak at all: a ship script must name
+# <owner>/<repo> to clone it, and a macOS bundle identifier legitimately contains it. It
+# becomes a leak only in something that ships.
 #
-# Absent the key, only the compartment class arms. That default is deliberate: a repo
+# Absent the key, only the always-on classes arm. That default is deliberate: a repo
 # nobody has classified is a repo whose audience nobody has thought about, and the
 # quiet failure there should be under-blocking a private repo, not stopping every
 # commit in it.
@@ -235,45 +224,36 @@ if _REPO.lower() in _DISTRIBUTING:
     CHECKS.extend(_STRUCTURAL_WHEN_DISTRIBUTING)
 
 # A repo never denies its own subject: it would flag its own business data on every
-# commit. Same rule as install_preflight_conf.py, and for the same reason.
+# commit. Any other consumer of the same guard config must apply the same rule.
 #
-# TWO SOURCES, and the second one is why this comment exists. Inferring the subject
-# from the directory name covers the easy case (a compartment's own repo) and MISSES
-# every repo that legitimately owns a compartment's work under a different name — a
-# ship plugin, a tooling repo, an archive. That case must be recorded explicitly, per
-# repo, under `own_subject_extra` in the guard config, so the exemption is auditable
-# and narrow rather than a blanket bypass.
+# TWO SOURCES. Inferring the subject from the directory name covers the easy case (a
+# compartment's own repo) and MISSES every repo that legitimately owns a compartment's
+# work under a different name: a ship plugin, a tooling repo, an archive. That case must
+# be recorded explicitly, per repo, under `own_subject_extra` in the guard config, so the
+# exemption is auditable and narrow rather than a blanket bypass. Two consumers of the
+# same config drift the moment one of them learns something the other does not.
 #
-# Shipped 2026-08-01 with only the name-based half wired up, which blocked a commit in
-# exactly the repo the owner had already sanctioned. The lesson is the general one: two
-# consumers of the same config (this hook and install_preflight_conf.py) drift the
-# moment one of them learns something the other does not.
-# GRANULARITY: an exemption must name the PATHS it applies to, not just the repo.
+# GRANULARITY: an exemption should name the PATHS it applies to, not just the repo.
 #
-# The first version granted per repo, which is too coarse in the common case. A repo
-# holds two kinds of file: source that legitimately names a compartment and never ships
-# (an account registry, token helpers), and files that DO ship (skills/**/SKILL.md, a
-# generated plugin.json). A repo-wide grant covers both, so it silently disarms the check
-# on exactly the files that matter — and the bigger the legitimate use, the wider the
-# hole. Measured on the second repo to need one: 3 tokens, 20/45/68 occurrences across
-# 4/10/17 tracked files, impossible to narrow at TOKEN granularity because that repo is
-# the account registry for the whole stack. Token granularity was the wrong axis; path
-# granularity is the right one, and `SKIP_PREFIXES` already encodes the same idea in
-# hook code.
+# A repo-wide grant is too coarse in the common case. A repo holds two kinds of file:
+# source that legitimately names a compartment and never ships (an account registry,
+# token helpers), and files that DO ship (skills/**/SKILL.md, a generated plugin.json).
+# A repo-wide grant covers both, so it silently disarms the check on exactly the files
+# that matter, and the bigger the legitimate use, the wider the hole. Narrowing by TOKEN
+# does not help a repo that legitimately uses its tokens across many files; narrowing by
+# PATH does, and `SKIP_PREFIXES` already encodes the same idea in hook code.
 #
 # TWO CONFIG SHAPES, and the second one exists because the first is a footgun ACROSS
-# VERSIONS. A sibling session verified this against the deployed hook rather than
-# theorising it:
+# VERSIONS (verified against older deployed copies of this hook):
 #
 #   "own_subject_extra": {"repo": {"tokens": [...], "paths": [...]}}
 #
-# is parsed by every PRE-scoping copy as `[t for t in extra if isinstance(t, str)]` —
+# is parsed by every PRE-scoping copy as `[t for t in extra if isinstance(t, str)]`,
 # and iterating a dict yields its KEYS. So an old copy exempts the literal strings
 # "tokens" and "paths", matches no real token, and the exemption silently evaporates.
 # It fails CLOSED (the commit blocks) rather than leaking, which is the safe direction,
-# but it blocks with no clue why — and the fleet always contains copies older than
-# canonical, so "just update the hook first" is a migration order somebody will get
-# wrong exactly once.
+# but it blocks with no clue why, and vendored copies always lag the source, so "just
+# update the hook first" is a migration order somebody will get wrong.
 #
 # THE FIX IS SHAPE, NOT SEQUENCING. Paths live under a separate top-level key:
 #
@@ -281,7 +261,7 @@ if _REPO.lower() in _DISTRIBUTING:
 #     "own_subject_paths": { "repo-b": ["src/", "scripts/"] }
 #
 # An old copy never sees `own_subject_paths`, reads the list exactly as it always did,
-# and keeps its previous repo-wide behaviour — safe, and identical to today. A new copy
+# and keeps its previous repo-wide behaviour: safe, and identical to before. A new copy
 # reads both and narrows the exemption to those paths. **Config written the new way is
 # therefore safe to deploy BEFORE the hook is vendored**, which removes the ordering
 # constraint rather than documenting it.
@@ -301,7 +281,7 @@ def _own_subject_spec():
     if isinstance(entry, list):
         wide += [t for t in entry if isinstance(t, str) and t.strip()]
     elif isinstance(entry, dict):
-        # Accepted, but see the hazard note above — prefer the two-key form.
+        # Accepted, but see the hazard note above; prefer the two-key form.
         toks = [t for t in (entry.get("tokens") or []) if isinstance(t, str) and t.strip()]
         paths = [q for q in (entry.get("paths") or []) if isinstance(q, str) and q.strip()]
         if toks and paths:
@@ -310,8 +290,8 @@ def _own_subject_spec():
             wide += toks
 
     # THE SAFE FORM: paths live under their OWN key, so old code never sees a shape it
-    # cannot parse. `own_subject_extra` keeps holding a plain list — exactly what every
-    # deployed copy already expects — and the scoping is additive.
+    # cannot parse. `own_subject_extra` keeps holding a plain list (exactly what every
+    # deployed copy already expects), and the scoping is additive.
     try:
         import json
         with open(GUARD_CFG) as fh:
@@ -329,7 +309,7 @@ def _own_subject_spec():
 _OWN, _SCOPED = _own_subject_spec()
 
 def _compile_alt(vals, word_bounded):
-    # Same non-alphanumeric boundary as _alternation — see the block comment there.
+    # Same non-alphanumeric boundary as _alternation; see the block comment there.
     # These two must stay in step: this one rebuilds the per-path variants, so a
     # `\b` here would silently restore the blind spot for every path-scoped class.
     body = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in vals)
@@ -338,7 +318,7 @@ def _compile_alt(vals, word_bounded):
 
 
 # Keep each value-bearing class's raw values so a per-path variant can be rebuilt. A
-# path-scoped exemption cannot be applied by deleting the token up front — that is
+# path-scoped exemption cannot be applied by deleting the token up front; that is
 # exactly the repo-wide behaviour it replaces.
 _CLASS_VALUES = {}
 
@@ -350,20 +330,20 @@ for _label, _key, _wb in _ARMED:
     CHECKS.insert(0, (_label, _compile_alt(_vals, _wb)))
 
 
-# HOME-DIRECTORY PATHS ARM IN EVERY REPO — the one personal shape the tier above must not gate.
+# HOME-DIRECTORY PATHS ARM IN EVERY REPO: the one personal shape the tier above must not gate.
 #
 # The tier keeps `personal_tokens` off in repos nobody has marked as distributing, because
 # the owner's login legitimately appears in a private repo: a `<owner>/<repo>` clone URL, a
-# bundle identifier. A HOME-DIRECTORY PATH has no such use. `/Users/<login>/...` is machine-
-# local and non-portable in every repo, so arming just that shape everywhere does not bring
-# back the work stoppage the tier was built to avoid.
+# bundle identifier. A HOME-DIRECTORY PATH has no such use. A path under the home folder is
+# machine-local and non-portable in every repo, so arming just that shape everywhere does
+# not bring back the work stoppage the tier was built to avoid.
 #
-# Why it exists (2026-09-28): a Claude session wrote its own tool-results cache path,
-# `~/.claude/projects/-Users-<login>-Developer/<session>/...`, into a doc in a private,
-# unclassified repo. The login sits in Claude's PROJECT SLUG there (`/` becomes `-`). The
-# config held the login and `personal-identifier` matches it as a substring, so the slug
-# form was never the problem; the class was simply not armed in that repo, and the commit
-# went through clean. Session scratch paths carry the same slug, so this is the shape
+# Why: tools write their own cache and scratch paths into files. Claude Code, for example,
+# keeps per-project state under `~/.claude/projects/-Users-<login>-<dir>/...`, where the
+# login sits inside a PROJECT SLUG (`/` becomes `-`). `personal-identifier` matches the
+# login as a substring, so the slug form is not the problem; the problem is that the class
+# is not armed in an unclassified private repo, so an agent pasting such a path into a doc
+# there would commit clean. Session scratch paths carry the same slug, so this is the shape
 # residue from an agent actually takes.
 #
 # Derived at runtime from `personal_tokens`, so no value enters this file, and with no
@@ -383,27 +363,24 @@ if _HOME_VALS:
         % "|".join(re.escape(v) for v in _HOME_VALS) + _WB_R, re.IGNORECASE)))
 
 
-# VISIBILITY FOR REPO-WIDE OWN-SUBJECT EXEMPTIONS — the silent hole that leaked (2026-08-19).
+# VISIBILITY FOR REPO-WIDE OWN-SUBJECT EXEMPTIONS: the silent hole.
 #
 # A repo-wide own-subject grant strips a compartment token from EVERY path in the repo,
 # `.github/` and `skills/` included, and does it SILENTLY. That is by design for a repo that
-# IS the subject (name-inferred: token is a substring of the repo name — naming itself is
-# expected). It is a FOOTGUN for a foreign repo that merely holds some legitimate references
-# and declares them via a plain-list `own_subject_extra` with no `own_subject_paths` narrowing:
-# the grant then disarms the guard on the repo's shipping paths too, and nothing says so.
-#
-# That is exactly what happened: a plain-list `own_subject_extra` grant for a distributing
-# repo (repo-wide) let a compartment name into its CI templates unblocked; the same token was
-# caught only at consume-time by a fresh repo's hook. The docstring had WARNED about the coarse
-# form for weeks and it still bit — documentation alone does not close an invisible-gate hole.
+# IS the subject (name-inferred: the token is a substring of the repo name, and naming itself
+# is expected). It is a FOOTGUN for a different repo that merely holds some legitimate
+# references and declares them via a plain-list `own_subject_extra` with no
+# `own_subject_paths` narrowing: the grant then disarms the guard on the repo's shipping
+# paths too (its CI templates, for example), and nothing says so. A warning in the docs
+# does not close an invisible-gate hole; making the gate visible does.
 #
 # The fix is not to BLOCK the coarse form (it is a supported, sometimes-correct choice, and a
 # repo like an account registry legitimately relies on it). The fix is to make each let-through
 # VISIBLE: a non-blocking NOTE naming path:line (never the value) for every added line a
-# repo-wide own_subject_extra grant is hiding. A name-inferred token needs no note — the repo
+# repo-wide own_subject_extra grant is hiding. A name-inferred token needs no note; the repo
 # is the subject. `_SHADOW` therefore matches ONLY the extra-sourced repo-wide tokens.
 #
-# STRICTLY ADDITIVE: `_SHADOW` never feeds `violations` or the exit code — it can only print a
+# STRICTLY ADDITIVE: `_SHADOW` never feeds `violations` or the exit code; it can only print a
 # diagnostic. Worst case if it ever errored is a fail-closed block, never a weakened gate.
 _OWN_WIDE_EXTRA = [t for t in _OWN if t.lower() not in _REPO.lower()]
 try:
@@ -433,7 +410,7 @@ def _checks_for(path):
     out = []
     for label, pat in CHECKS:
         if label not in _CLASS_VALUES:
-            out.append((label, pat))          # structural class — never exemptable
+            out.append((label, pat))          # structural class: never exemptable
             continue
         vals, wb = _CLASS_VALUES[label]
         keep = [v for v in vals if v not in exempt]
@@ -441,31 +418,29 @@ def _checks_for(path):
             out.append((label, _compile_alt(keep, wb)))
     return out
 
-# WHAT MAY BE EXEMPTED — and the one thing that never may.
+# WHAT MAY BE EXEMPTED, and the one thing that never may.
 #
-# NEVER exempt the guard's own rule files. This tuple once held ("scripts/githooks/",)
-# so the guard could not police itself — and that exemption was load-bearing for the
-# 2026-07-15 leak, because the rule files were exactly where the tokens hid. Every value
-# is config-sourced now, so those files contain nothing to hide and the guard scans
-# itself. Re-adding a self-exemption would recreate the original hole.
+# NEVER exempt the guard's own rule files. Exempting this hook's directory means the guard
+# cannot police itself, and rule files are exactly where a split or encoded value would
+# hide (see "NO SENSITIVE VALUE" above). Every value is config-sourced, so these files
+# contain nothing to hide and the guard scans itself. Re-adding a self-exemption would
+# recreate that hole.
 #
 # What IS legitimate to skip is a different question: paths the build NEVER PACKAGES.
 # An identifier there cannot reach a recipient, because nothing carries it to one. This
-# narrows WHERE the scanner looks, never WHAT it looks for — dropping a token from the
+# narrows WHERE the scanner looks, never WHAT it looks for; dropping a token from the
 # guard config to quieten a hit would silently reopen the leak that token closed.
 #
-# Why this exists (2026-07-30): adding the owner's GitHub namespace to the config — after
-# the bundle gate was caught passing `<owner>/<repo>` into the shipped plugin — made the
-# hook fire on legitimate self-references: a README citing its own clone URL, a build
-# comment recording provenance, an internal audit doc quoting real history. Those were
-# papered over with per-line `denylist:ignore` pragmas, which does not scale and trains
-# people to add one reflexively instead of reading the hit. Per-line pragmas remain the
-# right tool for a ONE-OFF exception in a file that DOES ship.
+# Why it exists: once the owner's GitHub namespace is configured, the hook fires on
+# legitimate self-references: a README citing its own clone URL, a build comment recording
+# provenance, an internal doc quoting real history. Papering those over with per-line
+# `denylist:ignore` pragmas does not scale and trains people to add one reflexively
+# instead of reading the hit. Per-line pragmas remain the right tool for a ONE-OFF
+# exception in a file that DOES ship.
 #
-# build_obrien_plugin.py is the authority on what ships — keep this in step with it. A
-# path listed here that later STARTS shipping becomes a hole, and that is not
-# hypothetical: scripts/githooks/ began shipping on 2026-07-31 (#113). Prefer
-# under-listing; when unsure, leave it scanned.
+# Keep this list in step with what the repo's build actually packages. A path listed here
+# that later STARTS shipping becomes a hole, so prefer under-listing; when unsure, leave
+# it scanned.
 SKIP_PREFIXES = (
     "build/",             # build tooling; not packaged
     "docs/internal/",     # explicitly excluded from the package
@@ -474,14 +449,13 @@ SKIP_PREFIXES = (
     "CONTRIBUTING",       # repo-facing
 )
 
-# HOME-PATH STILL SCANS THREE OF THOSE (2026-09-28, scotty#150). The skips above answer
-# "what does obrien's plugin build package?", but home-path answers a fleet-wide question:
-# would this line need scrubbing if the repo went public? A README is the first file anyone
-# reads then, and build tooling that hardcodes a home folder breaks on every other machine.
-# `docs/internal/` stays fully skipped (it is the sanctioned home for real history), and so
-# does `tests/` (a path detector's own tests legitimately contain the pattern). Measured
-# across 58 repos when this landed: 0 home-path lines under these three prefixes, so it
-# blocked nothing on arrival. Every OTHER class keeps skipping them.
+# HOME-PATH STILL SCANS THREE OF THOSE. The skips above answer "what does the build
+# package?", but home-path answers a different question: would this line need scrubbing
+# if the repo went public? A README is the first file anyone reads then, and build tooling
+# that hardcodes a home folder breaks on every other machine. `docs/internal/` stays fully
+# skipped (it is the sanctioned home for real history), and so does `tests/` (a path
+# detector's own tests legitimately contain the pattern). Every OTHER class keeps skipping
+# them.
 _HOME_ALSO_SCANS = ("README", "CONTRIBUTING", "build/")
 
 
@@ -512,9 +486,9 @@ def git_lines(text):
     actually looking at.
 
     That is a FAIL-OPEN, and it needs no attacker: U+2028 arrives routinely from PDF
-    extraction and JS minifiers and is invisible in most editors. Reproduced 2026-08-19 —
-    a staged line adding an RFC1918 address went through unblocked with a single U+2028
-    elsewhere in the file.
+    extraction and JS minifiers and is invisible in most editors. With splitlines(), a
+    staged line adding an RFC1918 address goes through unblocked whenever a single U+2028
+    appears earlier in the file.
 
     Fail-open is the one direction this guard must never fail in, so the two numbering schemes
     have to be the same scheme, not merely similar.
@@ -527,13 +501,13 @@ def collapse_concats(line):
     splitting is scanned in its reconstructed form.
 
     This is what makes the no-values-in-the-guard rule self-enforcing. Config-sourcing
-    removed the values, and dropping SKIP_PREFIXES made the guard scan its own rule
-    files — but neither catches the ORIGINAL evasion, which was to spell a value out as
+    keeps the values out, and not exempting this hook's directory makes the guard scan its
+    own rule files, but neither catches the classic evasion: spelling a value out as
     `"s" "e" "c" ...` or `r"com\\." + "<name>"`. Those defeat a literal scan by
     construction. Reconstructing first means splitting buys nothing, which is the whole
     point: a detector cannot hide its own secret, so stop letting anyone try.
 
-    Applied in ADDITION to the raw line (never instead of it) — folding could in
+    Applied in ADDITION to the raw line (never instead of it), because folding could in
     principle mask a match that spans a quote boundary. Bounded loop; no regex
     backtracking risk on pathological input.
     """
@@ -547,7 +521,7 @@ def collapse_concats(line):
 
 
 def _blocked_unreadable(why):
-    print("pre-commit[discreet-denylist]: BLOCKED — could not read the staged file list "
+    print("pre-commit[discreet-denylist]: BLOCKED: could not read the staged file list "
           f"({why}); refusing to pass an unscanned commit.", file=sys.stderr)
     sys.exit(1)
 
@@ -559,15 +533,15 @@ def staged_files():
     """[(path, renamed_from, old_blob, new_blob)] for every file this commit adds, modifies,
     renames or changes the type of. `old_blob` is None when every line counts as new.
 
-    RENAMES WERE INVISIBLE until 2026-09-28 (scotty#148). The list came from
-    `--diff-filter=ACM`, and git reports a file moved AND edited in one commit as `R`, so its
-    added lines were never judged, for any class: `git mv a b`, append a violating line,
-    commit, clean. TYPE CHANGES (`T`, a symlink replaced by a file) were invisible the same
-    way. Adding `R` alone is not the fix: diffed on its own, the new path has no old side and
-    reads as a brand-new file, which re-judges every line anything that moves already carries
-    (the stale-hit false positive #74 removed). So a rename keeps its old blob.
+    WHY RENAMES AND TYPE CHANGES ARE IN THE FILTER. With `--diff-filter=ACM`, git reports a
+    file moved AND edited in one commit as `R`, so its added lines are never judged, for any
+    class: `git mv a b`, append a violating line, commit, clean. TYPE CHANGES (`T`, a symlink
+    replaced by a file) are invisible the same way. Adding `R` alone is not the fix: diffed on
+    its own, the new path has no old side and reads as a brand-new file, which re-judges every
+    line anything that moves already carries (the stale-hit false positive that diff-scoping
+    exists to prevent; see added_lines()). So a rename keeps its old blob.
 
-    WHY BLOB IDS, NOT PATHS OR SIMILARITY (found in review, both reproduced):
+    WHY BLOB IDS, NOT PATHS OR SIMILARITY (both reproduced):
       - git's "similarity index 100%" is an ESTIMATE over hashed chunks. Reordering 64-byte
         chunks of a line can form a new RFC1918 address while git still reports R100, so a
         similarity figure must never stand in for "unchanged". Equal blob ids are the only
@@ -579,12 +553,11 @@ def staged_files():
     `-M` is explicit so `diff.renames` cannot change the answer. A rename git declines to pair
     (too dissimilar, or past renameLimit) arrives as a plain `A` and is scanned end to end.
 
-    FAIL CLOSED on a git error. Discarding the rc (the old `_, out`) meant a failed
-    `git diff` returned an empty list -> zero files scanned -> the gate PASSED an
-    unscanned commit. That is exactly this file's own stated failure mode: "a detector
-    that will not say what it found cannot be told apart from one that is wrong." A
-    security gate that cannot read the index must BLOCK, never wave the commit through.
-    The same holds for a `-z` record this parser does not recognise.
+    FAIL CLOSED on a git error. Discarding the return code would turn a failed
+    `git diff` into an empty list -> zero files scanned -> the gate PASSES an unscanned
+    commit. A detector that will not say what it found cannot be told apart from one
+    that is wrong: a security gate that cannot read the index must BLOCK, never wave the
+    commit through. The same holds for a `-z` record this parser does not recognise.
     """
     rc, out = _git_text(["git", "diff", "--cached", "--raw", "-z", "--no-abbrev", "-M",
                          "--diff-filter=ACMRT"])
@@ -637,32 +610,31 @@ def added_lines(old_blob, new_blob):
     Returns an empty set only on PROOF of identical content: equal blob ids (a pure rename,
     or a mode-only change, which used to re-judge the whole file on a chmod).
     Fail-closed is the whole design here: an unparseable hunk header must never be
-    read as "this commit added nothing", because that silently disarms the guard —
-    the invisible-gate failure this repo has already been bitten by twice (the
-    `OBRIEN_ALLOW_DENYLIST=0` bypass, and a denylist layer that never executed on any
-    repo for weeks while printing PASS).
+    read as "this commit added nothing", because that silently disarms the guard. A
+    gate that quietly does nothing while reporting a pass is worse than no gate.
 
     WHY DIFF-SCOPE AT ALL. Judging the whole staged blob means judging lines the
-    commit did not write, and the only escape from a false hit is
-    OBRIEN_ALLOW_DENYLIST=1 — which disarms ALL classes for the whole commit,
-    compartment-name included. So one stale hit on an untouched line does not merely
-    annoy; it converts the guard into a total bypass, and it teaches the operator to
-    reach for that bypass by reflex. Measured 2026-08-01: 14 armed repos carry a
-    `localhost:<port>` in tracked files (mostly Ollama's published default 11434),
-    none of them added by the commits they were blocking.
+    commit did not write, and the only escape from a false hit is the bypass variable,
+    which disarms ALL classes for the whole commit, compartment-name included. So one
+    stale hit on an untouched line does not merely annoy; it converts the guard into a
+    total bypass, and it teaches the operator to reach for that bypass by reflex.
+    Pre-existing hits are common: a `localhost:<port>` naming a published default port
+    (Ollama's 11434, say) sits in many tracked files, added long before the commit it
+    would block.
 
     Content already committed and pushed cannot be un-published by refusing the next
-    commit; "is the shipped artifact clean?" is answered at build time by the bundle
-    scanner, which reads the whole payload. This hook's job is "do not ADD it".
+    commit; "is the shipped artifact clean?" is answered at build time by a scan of the
+    whole payload. This hook's job is "do not ADD it".
     """
     if old_blob is None:
         return None
     if old_blob == new_blob:
         return set()
-    # THE crash site: this diff carries the file's own content lines, so a repo with one
-    # Latin-1 file killed the whole hook. Blob to blob: no pathspec, no external diff, no
-    # textconv. Attributes are NOT fully out of play: git matches them against the blob id
-    # as if it were a name, so a catch-all `* -diff` or `* binary` still suppresses hunks.
+    # This diff carries the file's own content lines, so a strict decode here would let
+    # one Latin-1 file kill the whole hook (hence _git_text). Blob to blob: no pathspec,
+    # no external diff, no textconv. Attributes are NOT fully out of play: git matches
+    # them against the blob id as if it were a name, so a catch-all `* -diff` or
+    # `* binary` still suppresses hunks.
     # That lands in the no-hunk branch below, which scans all: the safe direction, and a
     # test pins it. The trailing `--` stops a worktree file named like a blob id from being
     # read as a path.
@@ -676,31 +648,37 @@ def added_lines(old_blob, new_blob):
             continue
         m = _HUNK.match(line)
         if not m:
-            return None                # unrecognised header — do not guess
+            return None                # unrecognised header: do not guess
         saw_hunk = True
         start = int(m.group(1))
         count = 1 if m.group(2) is None else int(m.group(2))
         nums.update(range(start, start + count))
     if not saw_hunk:
-        return None                    # blobs differ but no hunk parsed — scan all
+        return None                    # blobs differ but no hunk parsed: scan all
     return nums
 
 
+# Bypass variables, checked in order. ALLOW_DENYLISTED_COMMIT is the current name; the
+# second is its legacy name, still honored with identical semantics so existing scripts,
+# docs, and habits keep working.
+_BYPASS_VARS = ("ALLOW_DENYLISTED_COMMIT", "OBRIEN_ALLOW_DENYLIST")
+
+
 def main():
-    # Require an explicit affirmative value. A bare truthiness test accepted ANY
-    # non-empty string — so `OBRIEN_ALLOW_DENYLIST=0`, which reads as "do not allow",
-    # silently BYPASSED the gate. That is the worst possible failure direction for a
-    # guard: the operator believes they disabled the bypass and instead disabled the
-    # check. Hit for real on 2026-07-29.
-    _bypass = os.environ.get("OBRIEN_ALLOW_DENYLIST", "").strip().lower()
-    if _bypass in ("1", "true", "yes"):
-        print("pre-commit[discreet-denylist]: BYPASSED via OBRIEN_ALLOW_DENYLIST",
-              file=sys.stderr)
-        return 0
-    if _bypass:
-        print(f"pre-commit[discreet-denylist]: OBRIEN_ALLOW_DENYLIST={_bypass!r} is not "
-              f"an affirmative value — gate STAYS ACTIVE. Use 1/true/yes to bypass.",
-              file=sys.stderr)
+    # Require an explicit affirmative value. A bare truthiness test accepts ANY non-empty
+    # string, so `...=0`, which reads as "do not allow", would silently BYPASS the gate.
+    # That is the worst possible failure direction for a guard: the operator believes
+    # they disabled the bypass and instead disabled the check.
+    for _var in _BYPASS_VARS:
+        if os.environ.get(_var, "").strip().lower() in ("1", "true", "yes"):
+            print(f"pre-commit[discreet-denylist]: BYPASSED via {_var}", file=sys.stderr)
+            return 0
+    for _var in _BYPASS_VARS:
+        _bypass = os.environ.get(_var, "").strip().lower()
+        if _bypass:
+            print(f"pre-commit[discreet-denylist]: {_var}={_bypass!r} is not "
+                  f"an affirmative value — gate STAYS ACTIVE. Use 1/true/yes to bypass.",
+                  file=sys.stderr)
 
     violations = []
     let_through = []               # added lines a repo-wide own_subject_extra grant is hiding
@@ -739,7 +717,7 @@ def main():
 
     if let_through:
         shown = let_through[:20]
-        print("\npre-commit[discreet-denylist]: NOTE — {} added line(s) contain a token "
+        print("\npre-commit[discreet-denylist]: NOTE: {} added line(s) contain a token "
               "exempted REPO-WIDE for this repo via own_subject_extra (no own_subject_paths "
               "narrowing). ALLOWED here, but a repo-wide own-subject grant also disarms this "
               "guard on shipping paths (.github/, skills/, scripts/):".format(len(let_through)),
@@ -750,42 +728,40 @@ def main():
             print(f"  … and {len(let_through) - len(shown)} more", file=sys.stderr)
         print("Narrow it to the paths that legitimately reference the token: add an "
               "own_subject_paths entry for this repo in\n"
-              "~/.config/claude-guards/compartments.json. Informational — the commit is NOT "
+              "~/.config/claude-guards/compartments.json. Informational: the commit is NOT "
               "blocked by this note.\n", file=sys.stderr)
 
     if violations:
-        print("\npre-commit[discreet-denylist]: BLOCKED — staged content contains "
-              "discreet/personal identifiers that must never ship or mirror:", file=sys.stderr)
+        print("\npre-commit[discreet-denylist]: BLOCKED: staged content contains "
+              "private identifiers that must never ship or mirror:", file=sys.stderr)
         for path, lineno, label in violations:
             print(f"  {path}:{lineno}  [{label}]", file=sys.stderr)
         print("\nScrub the value (config-source it / genericize it) before committing.", file=sys.stderr)
-        print("Genuine exception (rare): OBRIEN_ALLOW_DENYLIST=1 git commit ...", file=sys.stderr)
+        print("Genuine exception (rare): ALLOW_DENYLISTED_COMMIT=1 git commit ...", file=sys.stderr)
         print("Per-line exception: add a `denylist:ignore` pragma to that line.\n", file=sys.stderr)
         return 1
     return 0
 
 
 # ── SWEEP MODE ──────────────────────────────────────────────────────────────────────
-# "Which repos would adding this token make uncommittable?" Today you find that out one
-# blocked commit at a time — which is how two repos' exemptions were discovered.
+# "Which repos would adding this token make uncommittable?" Without this you find out one
+# blocked commit at a time.
 #
-# WHY THIS LIVES IN THE HOOK AND NOT IN A SEPARATE SCRIPT. A sibling built exactly this
-# externally, twice, and got it wrong the first time: it reported 6 repos would block when
-# the true answer was 1. The reimplementation missed name-based own-subject inference,
-# own_subject_extra, SKIP_PREFIXES, and the binary skip — four behaviours that all live
-# here. Any external caller re-derives this matching logic and drifts from it, and a sweep
-# that is confidently wrong is worse than no sweep, because its whole purpose is to be
-# believed before someone changes config.
+# WHY THIS LIVES IN THE HOOK AND NOT IN A SEPARATE SCRIPT. An external reimplementation of
+# this survey drifts from the gate: it is easy to miss name-based own-subject inference,
+# own_subject_extra, SKIP_PREFIXES, or the binary skip (four behaviours that all live here)
+# and over-report several-fold as a result. A sweep that is confidently wrong is worse than
+# no sweep, because its whole purpose is to be believed before someone changes config.
 #
 # HOW IT STAYS HONEST: --sweep re-executes THIS FILE once per repo with that repo as cwd.
-# Every per-repo decision — _REPO, _ARMED, _OWN, _SCOPED, the compiled CHECKS — is
+# Every per-repo decision (_REPO, _ARMED, _OWN, _SCOPED, the compiled CHECKS) is
 # computed at import against the current working tree, so a subprocess per repo gets them
 # right by construction rather than by reimplementation. The only substitutions are the
 # two that make it a survey instead of a commit gate:
 #     staged_files() -> tracked files      (git ls-files, not the index diff)
 #     added_lines()  -> None               (judge the whole blob, as fail-closed already does)
 #
-# Output is `repo<TAB>path<TAB>label`, so it pipes into the fleet audit and into cut/sort.
+# Output is `repo<TAB>path<TAB>label`, so it pipes into other tools and into cut/sort.
 # Exit is ALWAYS 0: this reports, it never blocks.
 def tracked_files():
     _, out = _git_text(["git", "ls-files", "-z"])
@@ -807,15 +783,15 @@ def tracked_blob(path):
         return None
     if b"\x00" in raw[:8192]:
         return None
-    # errors="replace", matching staged_blob(). A strict decode here returned None on any
-    # non-UTF-8 file, which the caller reads as "nothing to see" — so `--sweep` walked past a
-    # Latin-1 file and reported nothing, silently. The sweep's whole job is to name what is
-    # there; under-reporting is the one thing it must not do, and it did it without a word.
+    # errors="replace", matching staged_blob(). A strict decode here would return None on
+    # any non-UTF-8 file, which the caller reads as "nothing to see", so `--sweep` would walk
+    # past a Latin-1 file and report nothing, silently. The sweep's whole job is to name what
+    # is there; under-reporting is the one thing it must not do.
     #
-    # This is the third instance of one mistake in this file: staged_blob() was lenient,
-    # added_line_numbers() was strict (scotty#107, it crashed), and this was strict (scotty#111,
-    # it went quiet). Same question, three answers. A binary file is still skipped by the NUL
-    # check above, which is the test that actually distinguishes "not text" from "not UTF-8".
+    # Every decode in this file must give the same answer (see _git_text): a strict one
+    # either crashes the gate or quietly under-reports. A binary file is still skipped by
+    # the NUL check above, which is the test that actually distinguishes "not text" from
+    # "not UTF-8".
     return raw.decode("utf-8", errors="replace")
 
 
@@ -825,11 +801,9 @@ def _sweep_basis():
     The sweep reads the WORKING TREE, so it answers for whatever branch this checkout
     happens to be parked on. A repo mid-feature reports its feature state; a repo on a
     stale branch reports history. Neither is the thing anyone is deciding about, and
-    both look identical to a real hit. Reported after a sibling's first real run
-    produced 11 rows of which most were phantoms from a checkout 7 commits behind its
-    own main, on a feature branch where a file they had already cleared still had 17
-    hits. Same defect the fleet audit had: a tool that will not name its own basis
-    cannot be told apart from a tool that is wrong.
+    both look identical to a real hit: a checkout a few commits behind, or parked on a
+    feature branch, produces phantom rows for files already cleared upstream. A tool
+    that will not name its own basis cannot be told apart from a tool that is wrong.
     """
     def _q(args):
         r = subprocess.run(args, capture_output=True, text=True)
@@ -851,11 +825,11 @@ def sweep_one():
     _branch, _sha, _behind = _sweep_basis()
     print(f"# {repo}@{_branch}@{_sha}", file=sys.stderr)
     if _behind:
-        print(f"#   \u26a0 {repo} is {_behind} commit(s) BEHIND its upstream — rows below "
+        print(f"#   \u26a0 {repo} is {_behind} commit(s) BEHIND its upstream; rows below "
               f"describe THIS CHECKOUT, not the repo. Pull before trusting them.",
               file=sys.stderr)
     if _branch not in ("main", "master", "dev", "staging", "trunk", "DETACHED"):
-        print(f"#   \u26a0 {repo} is on feature branch '{_branch}' — rows below describe that "
+        print(f"#   \u26a0 {repo} is on feature branch '{_branch}'; rows below describe that "
               f"branch's state, not the default branch anyone will clone.", file=sys.stderr)
     for path in tracked_files():
         checks = _checks_at(path)
@@ -889,18 +863,18 @@ def sweep(repos):
     # SAY WHAT THIS IS, on the output, every run.
     #
     # The sweep judges the WHOLE BLOB; a real commit judges only the lines it ADDS
-    # (added_lines(), scotty#74). So a row here means "this file CONTAINS a value", not
-    # "your next commit will block" — editing an unrelated line in one of these files is
-    # fine. Over-reporting is the correct direction for a planning tool, but only if it
-    # is labelled, or someone reads a 27-row repo as 27 broken commits.
+    # (added_lines()). So a row here means "this file CONTAINS a value", not "your next
+    # commit will block"; editing an unrelated line in one of these files is fine.
+    # Over-reporting is the correct direction for a planning tool, but only if it is
+    # labelled, or someone reads a 27-row repo as 27 broken commits.
     print("# denylist --sweep: repo\tpath:line\tclass", file=sys.stderr)
     print("# WHOLE-BLOB survey. A row = this file CONTAINS a matching value. A real commit"
           " judges only ADDED lines, so this is an upper bound, not a prediction.",
           file=sys.stderr)
     print("# Rows describe each repo's WORKING TREE at the branch shown in its '# repo@branch@sha'"
           " line. For a repo that SHIPS an artifact, the question that decides severity is whether"
-          " the ARTIFACT carries the value, not the repo: validating one repo's built plugin found"
-          " 1 deliberate carrier against 12 repo-level rows, a 12:1 over-report.", file=sys.stderr)
+          " the ARTIFACT carries the value, not the repo: repo-level rows can over-report what"
+          " the built artifact actually carries many times over.", file=sys.stderr)
     rc = 0
     for r in repos:
         r = os.path.abspath(os.path.expanduser(r))
@@ -911,10 +885,9 @@ def sweep(repos):
                              cwd=r, capture_output=True, text=True)
         sys.stdout.write(res.stdout)
         # FORWARD the child's stderr. It carries the per-repo basis line and the
-        # behind/feature-branch warnings — the whole point of which is that the reader
-        # sees them. Capturing and dropping it made this function silently discard its
-        # own diagnostics, which is the same muting defect the fleet has been chasing
-        # all day, committed inside the tool built to expose it.
+        # behind/feature-branch warnings, the whole point of which is that the reader
+        # sees them. Capturing and dropping it would make this function silently discard
+        # its own diagnostics.
         if res.stderr:
             sys.stderr.write(res.stderr)
         if res.returncode != 0:
