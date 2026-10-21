@@ -1,64 +1,192 @@
 #!/usr/bin/env bash
-# post-commit: auto-publish the current branch to origin ("remote control").
+# post-commit: back every commit up off the machine, without publishing the branch.
 #
-# Part of the "1 branch = 1 worktree = 1 session" model: every unit of work is backed
-# up to its own origin/<branch> the moment it is committed, so nothing sits stranded
-# in a local worktree where a deleted directory or a dead disk would take it.
+# Part of the "1 branch = 1 worktree = 1 session" model: nothing should sit stranded in
+# a local worktree where a deleted directory or a dead disk would take it, so every
+# commit is copied to origin the moment it is made.
 #
-# Scope: feature/session branches are pushed to origin/<branch>. Trunk branches
-# (main, master, staging, dev) are never published by this hook; they are mirrored to
-# refs/backup/<branch> instead (see below). main is also covered by the pre-push guard.
+# WHERE THE COPY GOES: a hidden ref, refs/backup/<branch>, never the branch itself.
+# Pushing the branch on every commit starts CI on every commit once the branch has a
+# pull request, and CI is billed per run (each job rounded up to a whole minute), so a
+# string of small commits costs many runs for one change. A refs/backup/* ref is a real
+# off-machine copy, but it is not a branch: it opens no PR, triggers no workflow, is not
+# shown on the GitHub site, and cannot trip pre-push.d/10-main-guard (which matches the
+# DESTINATION refs/heads/main).
+#
+# WHICH COMMIT: the branch as it is when the backup runs. Backups from one repository
+# run one at a time (a lock in its git directory, shared by all its worktrees), and each
+# reads refs/heads/<branch> only once it holds the lock. So when two commits land inside
+# one push's latency (a commit and an amend, or two quick commits), whichever job runs
+# second backs up the newest commit, or finds it already backed up. The branch ref, not
+# HEAD, is read, so a quick `git checkout` cannot send another branch's commit.
+#
+# NEVER SOMEONE ELSE'S: the backup is replaced only when that loses nothing. This
+# checkout records the commit it last copied in a local ref, refs/backed-up/<branch>
+# (which also lets the stranded-work audit see, without the network, which commits have
+# an off-machine copy). The update is forced only with a lease, and replaces origin's
+# copy when it is:
+#   - the commit this checkout last copied, and the branch has held it (its reflog says
+#     so; a branch deleted and recreated under the same name does not inherit the record),
+#     so an amend or rebase here updates the backup;
+#   - missing (never made, or deleted since);
+#   - already contained in the commit being backed up; or
+#   - already on one of origin's branches, so it is safe there.
+# Anything else is another clone's work, or history rewritten elsewhere: it is left as is,
+# and the failure says how to rescue it. Every failure is shown on the next commit.
+#
+# PUSHING THE BRANCH IS DELIBERATE: when a change is finished and its checks pass, push
+# it yourself (git push -u origin <branch>). The hook prints that reminder on each
+# feature-branch commit (it cannot say the backup succeeded: the push is still running). A repo that wants the old publish-on-every-commit behavior for
+# its feature branches can opt in:  git config hooks.postCommitPublish true
+# Trunks (main, master, staging, dev) are always backed up, never published, either way.
+#
+# Recover a backup with:  git fetch origin refs/backup/<branch>:refs/heads/rescue-<branch>
+#   (scripts/session-worktree.sh does this on its own when it recreates a branch)
+# List them with:         git ls-remote origin 'refs/backup/*'
+# A branch whose name nests under another backup's name (fix/x after a branch named fix
+# was backed up) cannot be backed up until that old ref is deleted; the failure is
+# recorded like any other.
 #
 # NON-BLOCKING, BUT NEVER SILENT ON FAILURE. The push runs in the background so the
 # commit returns immediately; a hook must not make you wait on the network. A failed
 # push is not discarded, though: stranded work looks exactly like pushed work, so a
 # push failure that leaves no trace goes unnoticed until someone asks git directly.
 # On failure the hook writes a per-repo marker plus a line in a shared log; a later
-# successful push removes the marker, so it cannot go stale and cry wolf. Success is
-# completely silent.
+# successful push removes the marker, so it cannot go stale and cry wolf.
 #
 # Read failures with:  cat ~/.claude/push-failures/*.log
 #
 # Install with: bash scripts/install-git-hooks.sh
 _pushfail_dir="$HOME/.claude/push-failures"
+_slug="$(printf '%s' "$PWD" | tr '/' '_' | sed 's/^_//').log"
+
+_fail() {   # $1 = label, $2 = what went wrong
+  mkdir -p "$_pushfail_dir" 2>/dev/null
+  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$1" \
+    "$(printf '%s' "$2" | tr '\n' ' ' | cut -c1-300)" >> "$_pushfail_dir/$_slug"
+  printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$1" >> "$_pushfail_dir/all.log"
+}
 
 _push_and_record() {   # $1 = refspec/branch args, $2 = human label
   (
     if err=$(git push $1 2>&1); then
       rm -f "$_pushfail_dir/$_slug" 2>/dev/null
     else
-      mkdir -p "$_pushfail_dir" 2>/dev/null
-      printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$2" \
-        "$(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)" >> "$_pushfail_dir/$_slug"
-      printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$2" \
-        >> "$_pushfail_dir/all.log"
+      _fail "$2" "$err"
     fi
   ) >/dev/null 2>&1 &
 }
 
-_slug="$(printf '%s' "$PWD" | tr '/' '_' | sed 's/^_//').log"
+_lockdir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/post-commit-backup.lock"
+
+_lock() {   # take this repository's backup lock (inside a backup job)
+  _me=$(exec sh -c 'echo "$PPID"')   # this job's own pid ($$ is the hook's, which has exited)
+  _tries=0
+  until mkdir "$_lockdir" 2>/dev/null; do
+    _tries=$((_tries + 1))
+    [ "$_tries" -gt 4000 ] && return 1   # about 15 minutes; also ends a lock that cannot be made
+    _holder=$(cat "$_lockdir/pid" 2>/dev/null)
+    # Break a lock whose holder has died, or that is older than 10 minutes (a hung push,
+    # or a pid reused after a restart); waiting on it would strand every later backup.
+    # Two jobs breaking the same stale lock at once can both run; the replace rules in
+    # _backup then refuse whichever push loses, and the next backup clears it.
+    if { [ -n "$_holder" ] && ! kill -0 "$_holder" 2>/dev/null; } \
+       || [ -n "$(find "$_lockdir" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+      rm -rf "$_lockdir"
+    else
+      sleep 0.2
+    fi
+  done
+  echo "$_me" > "$_lockdir/pid"
+  trap '[ "$(cat "$_lockdir/pid" 2>/dev/null)" = "$_me" ] && rm -rf "$_lockdir"' EXIT
+}
+
+_on_origin() {   # $1 = commit, $2 = ref it can be fetched from: is it on a branch of origin?
+  git cat-file -e "$1^{commit}" 2>/dev/null \
+    || git fetch -q --no-write-fetch-head --refmap= origin "$2" 2>/dev/null || return 1
+  heads=$(git ls-remote --heads origin 2>/dev/null) || return 1
+  # Fetch the branch tips this clone does not have, so a backup merged into a branch since
+  # the last fetch is found. --refmap= keeps git from moving origin/* as it goes: a tracking
+  # ref updated behind the user's back would let a later --force-with-lease overwrite work
+  # they never saw.
+  missing=$(printf '%s\n' "$heads" | while read -r sha ref; do
+    [ -n "$sha" ] && ! git cat-file -e "$sha^{commit}" 2>/dev/null && printf '%s\n' "$ref"
+  done)
+  [ -n "$missing" ] && printf '%s\n' "$missing" | xargs git fetch -q --no-write-fetch-head --refmap= origin 2>/dev/null
+  printf '%s\n' "$heads" | {
+    while read -r sha _; do
+      [ -n "$sha" ] && git merge-base --is-ancestor "$1" "$sha" 2>/dev/null && exit 0
+    done
+    exit 1
+  }
+}
+
+_recorded() {   # $1 = record ref, $2 = commit now on origin's backup
+  git update-ref "$1" "$2"   # if this fails, the next backup only costs one more lookup
+  rm -f "$_pushfail_dir/$_slug" 2>/dev/null
+}
+
+_backup() {   # $1 = branch, $2 = commit made, $3 = label
+  (
+    _lock || { _fail "$3" "waited too long for this repository's backup lock ($_lockdir); not backed up"; exit 0; }
+    dst="refs/backup/$1"
+    mine="refs/backed-up/$1"
+    tip=$(git rev-parse --verify -q "refs/heads/$1") || tip=$2
+    rec=$(git rev-parse --verify -q "$mine")
+    # Trust the record only for the branch that made it: a deleted-and-recreated branch
+    # has a new reflog without it. (A repo with reflogs turned off has none to check.)
+    if [ -n "$rec" ] && git rev-parse --verify -q "refs/heads/$1" >/dev/null \
+       && { ! git reflog exists "refs/heads/$1" \
+            || git log -g --format=%H "refs/heads/$1" 2>/dev/null | grep -qx "$rec"; }; then
+      # A newer job already backed this up (or the branch was reset back inside it).
+      git merge-base --is-ancestor "$tip" "$rec" 2>/dev/null && exit 0
+      # The usual case, in one round trip: origin still holds the copy made from here.
+      if git push -q --force-with-lease="$dst:$rec" origin "$tip:$dst" >/dev/null 2>&1; then
+        _recorded "$mine" "$tip"; exit 0
+      fi
+    else
+      rec=""
+    fi
+    if ! out=$(git ls-remote origin "$dst" 2>&1); then _fail "$3" "$out"; exit 0; fi
+    cur=$(printf '%s\n' "$out" | awk -v r="$dst" '$2 == r { print $1 }')
+    [ "$cur" = "$tip" ] && { _recorded "$mine" "$tip"; exit 0; }
+    if [ -n "$cur" ] && [ "$cur" != "$rec" ] \
+       && ! git merge-base --is-ancestor "$cur" "$tip" 2>/dev/null \
+       && ! _on_origin "$cur" "$dst"; then
+      _fail "$3" "origin's $dst holds $cur, which this commit does not contain and no branch on origin holds (another clone's backup, or rewritten history); left as is. Rescue it with: git fetch origin $dst:refs/heads/rescue-$1 (merge it in, or once it is safe elsewhere: git push origin :$dst)"
+      exit 0
+    fi
+    if err=$(git push --force-with-lease="$dst:$cur" origin "$tip:$dst" 2>&1); then
+      _recorded "$mine" "$tip"
+    else
+      _fail "$3" "$err"
+    fi
+  ) >/dev/null 2>&1 &
+}
 
 branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || exit 0
 [ -z "$branch" ] && exit 0
+commit=$(git rev-parse --verify -q HEAD) || exit 0
+# A backup fails in the background, after its commit has returned, so say so here, on
+# the next commit. The marker goes away when a backup from this checkout succeeds.
+if [ -s "$_pushfail_dir/$_slug" ]; then
+  echo "post-commit: the last backup from this checkout failed: $(tail -n 1 "$_pushfail_dir/$_slug" | cut -f3- | tr '\t' ' ' | cut -c1-400) (log: $_pushfail_dir/$_slug)" >&2
+fi
 case "$branch" in
   main | master | staging | dev)
-    # TRUNK COMMITS STILL GET AN OFF-MACHINE COPY, just not by publishing the trunk.
-    #
-    # A trunk should be pushed deliberately, not by a hook. But skipping trunks
-    # entirely leaves work committed directly to a trunk (typically in a shared
-    # checkout, where the risk is highest) with no backup at all.
-    #
-    # So mirror the trunk to refs/backup/<branch> instead. That is a real off-machine
-    # copy; it does NOT move origin/<trunk>, does not open a PR or trigger CI, and
-    # cannot trip pre-push.d/10-main-guard (which matches on the DESTINATION ref
-    # refs/heads/main, not on what is being pushed). Force-updated because it is a
-    # mirror of local state, not a branch anyone builds on.
-    #
-    # Recover with:  git fetch origin refs/backup/<branch>:refs/heads/rescue-<branch>
-    _push_and_record "-f origin HEAD:refs/backup/$branch" "trunk-backup:$branch"
+    # A trunk is pushed deliberately, never by a hook, but work committed directly to a
+    # trunk (typically in a shared checkout, where the risk is highest) still gets its
+    # off-machine copy.
+    _backup "$branch" "$commit" "trunk-backup:$branch"
     exit 0 ;;
 esac
 
-# Feature branch: background push; a failure is recorded as described above.
-_push_and_record "-u origin $branch" "feature-branch:$branch"
+if [ "$(git config --bool hooks.postCommitPublish 2>/dev/null)" = "true" ]; then
+  # Opted in: publish the branch on every commit, as this hook used to everywhere.
+  _push_and_record "-u origin refs/heads/$branch" "feature-branch:$branch"
+  exit 0
+fi
+
+_backup "$branch" "$commit" "branch-backup:$branch"
+echo "post-commit: backing up to refs/backup/$branch (failures are logged in ~/.claude/push-failures/); push the branch when the change is ready: git push -u origin $branch" >&2
 exit 0
