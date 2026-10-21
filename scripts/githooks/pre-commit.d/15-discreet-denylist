@@ -268,9 +268,196 @@ if _REPO.lower() in _DISTRIBUTING:
 #
 # The inline dict form is still accepted for anything already written that way, but the
 # two-key form is what to use.
-def _own_subject_spec():
-    """(repo_wide_tokens, [(path_prefix_tuple, token_set), ...]) for this repo."""
+#
+# OWN SUBJECT BY WHERE THE REPO LIVES, NOT ONLY BY WHAT ITS FOLDER IS CALLED.
+#
+# Name inference recognizes a compartment's own repo only when the token is in the
+# directory name. An organization's repos are not all named after it: a repo called
+# `dev-ops` inside the org is as much the org's own subject as one named after the org,
+# and its CODEOWNERS file legitimately names the org's accounts. Per-repo
+# `own_subject_extra` entries cover one repo at a time, so every new org repo blocks on
+# its first such commit until someone remembers to add one.
+#
+# So the local config may map an org to the compartment tokens it owns:
+#
+#     "own_subject_orgs": { "github.com/<owner>": ["<token>"] }
+#
+# and a repo whose remotes ALL live under that owner gets those tokens as its own
+# subject, repo-wide, exactly like name inference (no NOTE: the repo IS the subject, and
+# an `own_subject_paths` entry does not narrow it, as it does not narrow the name half).
+#
+# WHY EVERY REMOTE, FETCH AND PUSH. The question is "where can this repo's content go?",
+# and a push URL or a second remote is somewhere it can go. A repo that merely has the
+# org as one remote, or fetches from it and pushes elsewhere, is not the org's repo, so
+# it stays armed. URLs come from `git remote get-url --all [--push]` rather than from
+# `remote.*.url`, because it reports them after `insteadOf`/`pushInsteadOf` rewriting and
+# includes `pushurl`, which is where content actually goes.
+#
+# WHY AN EXACT OWNER MATCH. `host/owner` must equal a configured key, never prefix-match
+# it: `<owner>-other` is a different account.
+#
+# WHAT IT CANNOT TOUCH. Only values that are also `compartment_tokens` are granted, and
+# only the compartment-name class honors the grant (`_own_for`), so even a value listed in
+# both compartment_tokens and the personal, owner-name or gateway lists stays blocked by
+# those classes; the structural and home-path classes are never exemptable by any grant.
+#
+# A URL THE PARSER READS DIFFERENTLY FROM GIT IS A HOLE. If this file decides a URL is
+# under the org while git (or curl beneath it) connects somewhere else, the grant follows
+# the wrong answer. Two such shapes were demonstrated in review: a `?` or `#` inside the
+# user part (`http://<elsewhere>?@<host>/<owner>/r` connects to <elsewhere>), and a `..`
+# path segment (`/<owner>/../<other>/r` is requested as `/<other>/r`). So the parser is an
+# allowlist: plain host, plain owner, and any URL holding `?`, `#`, `%`, `\`, whitespace,
+# or a `.`/`..` segment parses to None (no grant). Unusual but legitimate URLs therefore
+# fail CLOSED, which is the right direction for a grant.
+#
+# CONTENT CAN GO WHERE A REMOTE LISTING DOES NOT LOOK. Review found four ways a plain
+# `git push`/`fetch` reaches somewhere no listed remote URL names, and each one refuses:
+#   - `remote.pushDefault`, `branch.<b>.pushRemote` and `branch.<b>.remote` may hold a URL,
+#     or a near-miss of a remote's name (" origin", "origin\nfoo") that git resolves to
+#     something else. Each value is read NUL-delimited (`git config -z`) and must EQUAL `.`
+#     or a configured remote's name, byte for byte; nothing is stripped.
+#   - Legacy remote files under `$GIT_DIR/remotes/` and `$GIT_DIR/branches/` are remotes git
+#     still honors but `git remote` and `git config` never show. Any entry there: no grant.
+#   - A remote with an empty or missing URL makes git push to `./<name>` as a local path.
+#     Every configured remote must report at least one non-empty fetch and push URL.
+#   - With several remotes and no explicit choice, git falls back to a default remote. The
+#     URL `git ls-remote --get-url` resolves to must itself be in the org, so a repo with
+#     two or more remotes and none named `origin` (and no branch default) is refused.
+#     That fails closed: such a repo blocks rather than leaks.
+#
+# RESIDUAL RISK, ACCEPTED. Pointing every remote of an unrelated repo at the org makes it
+# pass. That takes a deliberate config change and is visible in the repo's git config; it
+# is a narrower hole than the bypass variable that already exists. Out of reach of any
+# commit-time rule: a URL typed on the command line (`git push <url>`), and transport-level
+# redirection that leaves the URL untouched (`core.sshCommand`, `http.proxy`, a
+# `~/.ssh/config` host alias, `remote.<name>.vcs` helpers). Those sit at the same trust
+# level as pointing HOME at another config, which already disarms every value class. No
+# remote at all means no grant, so a fresh `git init` stays armed.
+_URL_UNSAFE = re.compile(r"[?#%\\\s]")
+_URL_HOSTED = re.compile(
+    r"^(?:https?|ssh|git)://(?:[A-Za-z0-9._~:-]+@)?([A-Za-z0-9.-]+)(?::\d+)?"
+    r"/([A-Za-z0-9][A-Za-z0-9._-]*)/(.+)$", re.IGNORECASE)
+_URL_SCP = re.compile(r"^(?:[A-Za-z0-9._~-]+@)?([A-Za-z0-9.-]+):([A-Za-z0-9][A-Za-z0-9._-]*)/(.+)$")
+_ORG_KEY = re.compile(r"^[a-z0-9.-]+/[a-z0-9][a-z0-9._-]*$")
+
+
+def _host_owner(url):
+    """`host/owner`, lowercased, for a plainly written hosted git URL; None otherwise.
+
+    Accepts https://[user@]host[:port]/owner/repo, ssh://[user@]host[:port]/owner/repo and
+    scp-style [user@]host:owner/repo. Local paths, file:// and other transports, owner-only
+    URLs, and anything the allowlist above refuses return None, which never grants.
+    """
+    url = (url or "").strip()
+    if not url or _URL_UNSAFE.search(url):
+        return None
+    m = _URL_HOSTED.match(url)
+    if not m and "://" not in url:
+        m = _URL_SCP.match(url)
+    if not m:
+        return None
+    if any(seg in (".", "..") for seg in m.group(3).split("/")):
+        return None
+    return "%s/%s" % (m.group(1).lower(), m.group(2).lower())
+
+
+def _remote_urls():
+    """Every URL this repo's content reaches through its own git config; None if unsure.
+
+    None (so the caller grants nothing) when a push or fetch target is not provably a
+    configured remote: see "CONTENT CAN GO WHERE A REMOTE LISTING DOES NOT LOOK" above.
+    """
+    for legacy in ("remotes", "branches"):
+        rc, out = _git_text(["git", "rev-parse", "--path-format=absolute", "--git-path", legacy])
+        if rc != 0:
+            return None
+        try:
+            if os.listdir(out.rstrip("\n")):
+                return None
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None
+    rc, out = _git_text(["git", "remote"])
+    if rc != 0:
+        return None
+    names = [n for n in out.split("\n") if n]
+    urls = []
+    for name in names:
+        if name.startswith("-"):
+            return None
+        for push in ([], ["--push"]):
+            rc, out = _git_text(["git", "remote", "get-url", "--all", *push, name])
+            got = [u for u in out.split("\n") if u]
+            if rc != 0 or not got or any(not u.strip() for u in got):
+                return None
+            urls += got
+    rc, out = _git_text(["git", "config", "-z", "--get-regexp",
+                         r"^(remote\.pushdefault|branch\..*\.(remote|pushremote))$"])
+    if rc == 1:
+        out = ""                       # no such keys
+    elif rc != 0:
+        return None
+    known = set(names) | {"."}
+    for item in out.split("\0"):
+        if not item:
+            continue
+        _key, sep, val = item.partition("\n")
+        if not sep or val not in known:
+            return None
+    if names:
+        rc, out = _git_text(["git", "ls-remote", "--get-url"])
+        default = out.rstrip("\n")
+        if rc != 0 or not default:
+            return None
+        urls.append(default)
+    return urls
+
+
+def _org_own_tokens():
+    """Compartment tokens this repo owns because every remote is in a configured org."""
+    try:
+        import json
+        with open(GUARD_CFG) as fh:
+            orgs = json.load(fh).get("own_subject_orgs") or {}
+    except Exception:
+        return []
+    if not isinstance(orgs, dict):
+        return []
+    table = {}
+    for key, toks in orgs.items():
+        if isinstance(key, str) and isinstance(toks, list):
+            norm = key.strip().lower()
+            if _ORG_KEY.match(norm):   # exactly host/owner; anything else grants nothing
+                table[norm] = {t.strip().lower() for t in toks
+                               if isinstance(t, str) and t.strip()}
+    if not table:
+        return []
+    urls = _remote_urls()
+    if not urls:
+        return []                      # no remote, or a target it can't see: no grant
+    granted = None
+    for url in urls:
+        key = _host_owner(url)
+        toks = table.get(key) if key else None
+        if not toks:
+            return []                  # one URL outside every configured org: no grant
+        granted = set(toks) if granted is None else granted & toks
+    return [t for t in _cfg_values("compartment_tokens") if t.lower() in (granted or set())]
+
+
+_ORG_OWN = _org_own_tokens()
+
+
+def _own_subject_spec(with_org=True):
+    """(repo_wide_tokens, [(path_prefix_tuple, token_set), ...]) for this repo.
+
+    with_org=False leaves out the org-derived grant; the classes other than
+    compartment-name are judged against that version (see _own_for).
+    """
     wide = [t for t in _cfg_values("compartment_tokens") if t.lower() in _REPO.lower()]
+    if with_org:
+        wide += [t for t in _ORG_OWN if t not in wide]
     scoped = []
     try:
         import json
@@ -302,11 +489,21 @@ def _own_subject_spec():
     if pth and wide:
         # Tokens named repo-wide become PATH-SCOPED once paths are declared for the repo.
         scoped.append((tuple(pth), set(wide)))
-        wide = [t for t in wide if t.lower() in _REPO.lower()]   # keep the name-derived half
+        # Keep the name- and org-derived half repo-wide: there the repo IS the subject.
+        wide = [t for t in wide if t.lower() in _REPO.lower() or (with_org and t in _ORG_OWN)]
     return wide, scoped
 
 
 _OWN, _SCOPED = _own_subject_spec()
+# An org grant is a COMPARTMENT grant only. A value configured both as a compartment token
+# and in another class (gateway, personal, owner) stays blocked by that other class in an
+# org repo, so every class except compartment-name is judged without the org half.
+_OWN_NO_ORG, _SCOPED_NO_ORG = _own_subject_spec(with_org=False)
+
+
+def _own_for(label):
+    """(repo_wide, scoped) own-subject grants that apply to class `label`."""
+    return (_OWN, _SCOPED) if label == "compartment-name" else (_OWN_NO_ORG, _SCOPED_NO_ORG)
 
 def _compile_alt(vals, word_bounded):
     # Same non-alphanumeric boundary as _alternation; see the block comment there.
@@ -323,7 +520,7 @@ def _compile_alt(vals, word_bounded):
 _CLASS_VALUES = {}
 
 for _label, _key, _wb in _ARMED:
-    _vals = [v for v in _cfg_values(_key) if v not in _OWN]
+    _vals = [v for v in _cfg_values(_key) if v not in _own_for(_label)[0]]
     if not _vals:
         continue
     _CLASS_VALUES[_label] = (_vals, _wb)
@@ -382,17 +579,17 @@ if _HOME_VALS:
 #
 # STRICTLY ADDITIVE: `_SHADOW` never feeds `violations` or the exit code; it can only print a
 # diagnostic. Worst case if it ever errored is a fail-closed block, never a weakened gate.
-_OWN_WIDE_EXTRA = [t for t in _OWN if t.lower() not in _REPO.lower()]
+_OWN_WIDE_EXTRA = [t for t in _OWN if t.lower() not in _REPO.lower() and t not in _ORG_OWN]
 try:
     _SHADOW = _compile_alt(_OWN_WIDE_EXTRA, True) if _OWN_WIDE_EXTRA else None
 except Exception:
     _SHADOW = None
 
 
-def _exempt_for(path):
+def _exempt_for(path, scoped=None):
     """Tokens a path-scoped own-subject grant exempts at THIS path (empty set if none)."""
     exempt = set()
-    for prefixes, toks in _SCOPED:
+    for prefixes, toks in (_SCOPED if scoped is None else scoped):
         if any(path.startswith(p) for p in prefixes):
             exempt |= toks
     return exempt
@@ -413,7 +610,8 @@ def _checks_for(path):
             out.append((label, pat))          # structural class: never exemptable
             continue
         vals, wb = _CLASS_VALUES[label]
-        keep = [v for v in vals if v not in exempt]
+        here = exempt if label == "compartment-name" else _exempt_for(path, _own_for(label)[1])
+        keep = [v for v in vals if v not in here]
         if keep:
             out.append((label, _compile_alt(keep, wb)))
     return out
