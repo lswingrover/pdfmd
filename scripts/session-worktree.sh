@@ -113,6 +113,33 @@ if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$BRANCH" \
   BRANCH_EXISTS=1
 fi
 
+# The post-commit hook backs each commit up to origin's refs/backup/<branch> and leaves
+# publishing the branch to a deliberate push, so the newest work on a branch may live
+# only in its backup. A clone never fetches refs/backup/*, so look for it here.
+BACKUP_SHA=""
+case "$BRANCH" in
+  main|master|staging|dev) ;;   # a trunk's backup is a mirror, not newer work
+  *) BACKUP_SHA=$(git -C "$ROOT" ls-remote origin "refs/backup/$BRANCH" 2>/dev/null \
+       | awk -v r="refs/backup/$BRANCH" '$2 == r { print $1 }') \
+       || { note "could not reach origin to look for refs/backup/$BRANCH (offline?); continuing without it"; BACKUP_SHA=""; } ;;
+esac
+[ -n "$BACKUP_SHA" ] && { git -C "$ROOT" fetch -q origin "refs/backup/$BRANCH" >/dev/null 2>&1 \
+  || { note "could not fetch refs/backup/$BRANCH; continuing without it"; BACKUP_SHA=""; }; }
+
+# take_backup <worktree>: fast-forward the new worktree to the backup when the backup is
+# strictly ahead; say so loudly when the two have diverged instead of guessing.
+take_backup() {
+  [ -n "$BACKUP_SHA" ] || return 0
+  local wt="$1" here; here=$(git -C "$wt" rev-parse HEAD)
+  [ "$here" = "$BACKUP_SHA" ] && return 0
+  if git -C "$wt" merge-base --is-ancestor "$here" "$BACKUP_SHA" 2>/dev/null; then
+    git -C "$wt" merge -q --ff-only "$BACKUP_SHA" \
+      && note "brought $BRANCH up to its backup (refs/backup/$BRANCH, $(git -C "$wt" rev-parse --short HEAD)), which held commits the branch did not"
+  elif ! git -C "$wt" merge-base --is-ancestor "$BACKUP_SHA" "$here" 2>/dev/null; then
+    note "WARNING: origin's refs/backup/$BRANCH ($(git -C "$ROOT" rev-parse --short "$BACKUP_SHA")) has commits this branch lacks and the two have diverged; nothing was changed. Look with: git log --oneline HEAD...$BACKUP_SHA"
+  fi
+}
+
 note "root=$ROOT  branch=$BRANCH  dest=$DEST  exists=$BRANCH_EXISTS"
 
 if [ "$BRANCH_EXISTS" -eq 1 ]; then
@@ -121,16 +148,31 @@ if [ "$BRANCH_EXISTS" -eq 1 ]; then
   note "fetching origin/$BRANCH"
   git -C "$ROOT" fetch origin "$BRANCH" >/dev/null 2>&1 || note "fetch failed (offline?) — using local ref"
   git -C "$ROOT" worktree add "$DEST" "$BRANCH"
+  take_backup "$DEST"
 else
   # New branch: base it on --ref, else origin/<branch> (won't exist here), else the
   # resolved integration branch (resolve_base_ref: dev-first->dev, staging-first->staging,
   # else origin/HEAD).
+  REF_GIVEN="$REF"
+  if [ -z "$REF" ] && [ -n "$BACKUP_SHA" ]; then
+    # Never published, but backed up: the backup IS the branch.
+    note "$BRANCH exists only as its backup (refs/backup/$BRANCH); recreating it from there"
+    REF="$BACKUP_SHA"
+  fi
   if [ -z "$REF" ]; then
     DEFREF=$(resolve_base_ref "$ROOT" || echo "origin/main")
     REF="$DEFREF"
   fi
-  note "fetching base ref $REF"
-  git -C "$ROOT" fetch origin "${REF#origin/}" >/dev/null 2>&1 || note "fetch failed (offline?) — using local $REF"
+  if [ "$REF" != "$BACKUP_SHA" ]; then
+    note "fetching base ref $REF"
+    git -C "$ROOT" fetch origin "${REF#origin/}" >/dev/null 2>&1 || note "fetch failed (offline?) — using local $REF"
+  fi
+  if [ -n "$REF_GIVEN" ] && [ -n "$BACKUP_SHA" ] \
+     && ! git -C "$ROOT" merge-base --is-ancestor "$BACKUP_SHA" "$REF" 2>/dev/null; then
+    # Starting from --ref leaves the backup out of the new branch. The post-commit hook
+    # will not overwrite it (it holds work this branch lacks), but say so now.
+    note "WARNING: origin's refs/backup/$BRANCH ($(git -C "$ROOT" rev-parse --short "$BACKUP_SHA")) is not in the new branch, which starts from $REF; its commits stay only in that backup. Rescue them with: git fetch origin refs/backup/$BRANCH:refs/heads/rescue-$BRANCH"
+  fi
   note "creating new branch $BRANCH from $REF"
   git -C "$ROOT" worktree add "$DEST" -b "$BRANCH" "$REF"
 fi
@@ -157,7 +199,41 @@ if [ "$DO_DEPS" -eq 1 ]; then
   deps() {
     if [ -f "$DEST/package.json" ]; then
       note "node project — installing deps"
-      if [ -f "$DEST/package-lock.json" ]; then ( cd "$DEST" && npm ci ); else ( cd "$DEST" && npm install ); fi
+      # Pick the package manager from the lockfile that is present, in precedence order,
+      # not from package-lock.json alone. A Yarn or pnpm project that also carries a stale
+      # package-lock.json (one stray `npm install` is enough) would otherwise get `npm ci`,
+      # which fails as soon as that lockfile is out of sync with package.json, and the
+      # worktree would land with no node_modules at all.
+      pm=npm-nolock
+      if   [ -f "$DEST/yarn.lock" ];                            then pm=yarn
+      elif [ -f "$DEST/pnpm-lock.yaml" ];                       then pm=pnpm
+      elif [ -f "$DEST/bun.lockb" ] || [ -f "$DEST/bun.lock" ]; then pm=bun
+      elif [ -f "$DEST/package-lock.json" ];                    then pm=npm
+      fi
+      # A lockfile whose tool is not installed falls back to `npm install` rather than
+      # failing: this whole block is best-effort and must never abort the run.
+      case "$pm" in
+        yarn|pnpm|bun)
+          command -v "$pm" >/dev/null 2>&1 || {
+            note "  $pm lockfile present but $pm is not installed; falling back to npm install"
+            pm=npm-nolock
+          } ;;
+      esac
+      # A frozen install that fails is retried without the flag, which may rewrite the
+      # lockfile; say so, so the change is reviewed rather than committed unnoticed.
+      thaw() { note "  frozen install failed; retrying without --frozen-lockfile (this may rewrite $1: review it before committing)"; }
+      case "$pm" in
+        yarn)       note "  yarn.lock: yarn install"
+                    ( cd "$DEST" && { yarn install --frozen-lockfile || { thaw yarn.lock; yarn install; }; } ) ;;
+        pnpm)       note "  pnpm-lock.yaml: pnpm install"
+                    ( cd "$DEST" && { pnpm install --frozen-lockfile || { thaw pnpm-lock.yaml; pnpm install; }; } ) ;;
+        bun)        note "  bun lockfile: bun install"
+                    ( cd "$DEST" && bun install ) ;;
+        npm)        note "  package-lock.json: npm ci"
+                    ( cd "$DEST" && npm ci ) ;;
+        npm-nolock) note "  no usable lockfile: npm install"
+                    ( cd "$DEST" && npm install ) ;;
+      esac
     elif [ -f "$DEST/pyproject.toml" ] || [ -f "$DEST/requirements.txt" ]; then
       note "python project — creating .venv + installing"
       ( cd "$DEST" && python3 -m venv .venv \

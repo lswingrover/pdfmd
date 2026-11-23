@@ -76,7 +76,7 @@ fi
 REF="${GITHOOKS_SOURCE_REF:-${SCOTTY_GITHOOKS_REF:-main}}"
 SUBPATH="scripts/githooks"
 # Vendored alongside the hooks so the dispatcher base + universal fragments + the
-# auto-push ("remote control") + the installer + the session helpers all travel
+# post-commit backup ("remote control") + the installer + the session helpers all travel
 # together and the consuming repo is self-sufficient.
 BASE_FILES="pre-commit pre-push post-commit CANONICAL.sha256"
 BASE_FRAGS="pre-commit.d/20-shared-checkout pre-push.d/10-main-guard pre-commit.d/10-secret-scan pre-commit.d/15-discreet-denylist"

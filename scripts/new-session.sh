@@ -2,7 +2,8 @@
 # new-session.sh <slug>: turnkey session isolation, descriptively named & matching.
 #
 # The operating model: 1 branch = 1 worktree = 1 session, with remote control
-# (post-commit auto-push). The <slug> is the ONE descriptive name shared by your
+# (post-commit backs every commit up to refs/backup/<branch>; the branch itself is
+# pushed deliberately when the change is ready). The <slug> is the ONE descriptive name shared by your
 # session title, your branch, and your worktree — so the three always match and
 # anyone can tell what each is at a glance. No random codenames.
 #
@@ -13,8 +14,9 @@
 #     remote default (main) and is wrong for dev-first repos.
 #   - copies .env essentials + links deps (immediately runnable)
 #   - vendors (if needed) + activates the canonical git hooks: shared-checkout guard,
-#     main-guard, secret-scan, and post-commit auto-push ("remote control")
-#   - seeds origin/<slug> so the branch is under remote control from the first commit
+#     main-guard, secret-scan, and the post-commit backup ("remote control")
+#   - seeds origin/<slug> at the base commit (no pull request yet, so pull-request CI does
+#     not run; a repo whose workflows run on every push still runs them once here)
 #   - prints the cd
 #
 # Usage:  bash scripts/new-session.sh <kebab-slug>
@@ -331,14 +333,16 @@ if [ -z "$dest" ]; then
   exit 1
 fi
 
-# Seed the remote branch now; the post-commit hook keeps it pushed thereafter.
+# Seed the remote branch now. After this, each commit is backed up to refs/backup/<slug> by
+# the post-commit hook, and the branch is pushed deliberately when the change is ready.
 git -C "$dest" push -u origin "$slug" >/dev/null 2>&1 || true
 
 cat <<EOF
 
 ================================================================
 ✅ Session isolated — 1 branch = 1 worktree = 1 session, all named "$slug".
-   branch  : $slug   (auto-pushes to origin/$slug on every commit)
+   branch  : $slug   (each commit backed up to refs/backup/$slug;
+             push the branch when ready: git push -u origin $slug)
    worktree: $dest
 ================================================================
 
